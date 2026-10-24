@@ -4,6 +4,7 @@
 
 ## 從哪裡開始
 
+- **新增：[固定 exp 情境逐段教材](exp-only/README.md)**：從熟悉的 `haz0_weibull`、`cox_exp` 開始，詳細解釋積分、上限加倍搜尋、資料生成、四個配適分支與完整動態 Brier 評分。此版獨立於原通式版，完整程式在 [exp-only/analysis.R](exp-only/analysis.R)。
 - **[REPORT.md](REPORT.md)**：報告用全文；每個主要程式區塊上方都有邏輯與符號說明，並附完整程式。
 - **[BASELINE_SWITCH.md](BASELINE_SWITCH.md)**：更換 exp、Weibull、lognormal、log-logistic 生成基線要改哪裡，含公式與參數表。
 - **[MODEL_STATUS.md](MODEL_STATUS.md)**：原碼哪些模型實際完成，哪些名稱不符，哪些尚未完成。
