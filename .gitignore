@@ -1,0 +1,14 @@
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+results/
+R-library/
+renv/library/
+*.rds
+*.Rout
+*.log
+.DS_Store
+Thumbs.db
+.env
+.env.*
