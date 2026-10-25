@@ -193,29 +193,29 @@ Z <- if (Z_dist == "binom") rbinom(n, 1, 0.5) else rnorm(n)
 
 在 exp 基線及直線型指標軌跡下，個人風險可寫為：
 
-$$
-h_i(t)=\mathrm{base}_i\exp\left(\mathrm{slope}_i\,t\right).
-$$
+```math
+h_i(t)=\mathrm{base}_i\exp\left(\mathrm{slope}_i t\right).
+```
 
 其中，base 是時間零的個人風險率，slope 是線性預測值隨時間變化的斜率。總累積風險為：
 
-$$
+```math
 A_i(\infty)=
 \begin{cases}
 \dfrac{\mathrm{base}_i}{-\mathrm{slope}_i}, & \mathrm{slope}_i<0,\\
 \infty, & \mathrm{slope}_i\ge 0.
 \end{cases}
-$$
+```
 
-將此上限傳入 cox_exp。若抽取的累積風險門檻不低於有限上限，真實事件時間記為 Inf；其餘情況使用數值積分與求根取得有限事件時間。
+將此上限傳入 `cox_exp`。若抽取的累積風險門檻不低於有限上限，真實事件時間記為 `Inf`；其餘情況使用數值積分與求根取得有限事件時間。
 
-最後生成設限時間，建立觀察時間與事件指標：
+令行政截止時間為 τ，對應程式中的 `admin_tau`。設限時間、觀察時間與事件指標為：
 
-$$
-C_i=\min\left(C_{\mathrm{ind},i},\texttt{admin\_tau}\right),\qquad
+```math
+C_i=\min(C_{\mathrm{ind},i},\tau),\qquad
 X_i=\min(T_i,C_i),\qquad
 \delta_i=I(T_i\le C_i).
-$$
+```
 ```r
   # 此處的累積風險上限公式限於 exp 基線
   if (length(shape) != 1L ||
