@@ -34,12 +34,6 @@ library(JM)
 library(JMbayes)
 
 haz0_weibull <- function(t, shape, scale, eps = 1e-12) {
-  if (length(shape) != 1L || !is.finite(shape) || shape <= 0 ||
-      length(scale) != 1L || !is.finite(scale) || scale <= 0 ||
-      length(eps) != 1L || !is.finite(eps) || eps <= 0 ||
-      any(!is.finite(t)) || any(t < 0)) {
-    stop("時間須非負且有限，shape、scale、eps 須為有限正數。")
-  }
   tt <- pmax(t, eps)
   (shape / scale) * (tt / scale)^(shape - 1)
 }
@@ -74,26 +68,6 @@ $$A_i(t)=\int_0^t h_i(u)\,du,\qquad S_i(t)=\exp[-A_i(t)].$$
 - 若 $f(10)\ge0$，門檻已在 0 到 10 之間被跨過，停止擴張。
 - 若 $f(10)<0$，累積風險還不夠；將 `tU` 改成 20，再算 $f(20)$。
 - 若仍小於 0，繼續試 40、80……，直到跨過門檻，或碰到 `t_upper_max`。
-
-例如假設 $E=1$、$A(10)=0.4$、$A(20)=0.8$、$A(40)=1.3$，就先找出含解的範圍，再請 `uniroot` 找到真正的時間。
-
-### 有沒有「拿上一段繼續積分」？
-
-**你貼的版本及此版都沒有快取上一段面積。** 上限從 10 擴到 20 時，程式重新呼叫 `A(20)`，重新積分 $\int_0^{20}h_i(u)du$。沿用的是先前的搜尋上限數值 `tU`，不是先前的積分結果。最後仍把 `c(0,tU)` 交給求根器，沒有改成 `c(上一個tU,新tU)`。
-
-數學上確實可以寫成 $A(20)=A(10)+\int_{10}^{20}h_i(u)du$，也可以利用已知符號縮小求根範圍；那是另一種加速實作。本版保留你熟悉的形式，避免一邊解釋原碼一邊換成不同演算法。不能只積分 10 到 20 的新面積，再直接拿它和整個門檻 E 比，因為那會漏掉先前的累積風險。
-
-### integrate 的「分區間」與精度
-
-`integrate` 會自適應細分積分區間；`subdivisions=2000L` 是允許的子區間數上限，不是預先切成 2,000 個等距時間點。`L` 表示整數。`rel.tol` 是要求的相對精度；這裡也明列 `abs.tol=rel.tol`，與原函數的預設一致。`$value` 取出積分估計值。這些是數值精度設定，不是研究的觀測時間間隔或樣本數。[R integrate 文件](https://stat.ethz.ch/R-manual/R-devel/library/stats/html/integrate.html)
-
-### uniroot 如何接手
-
-抽到 $E>0$ 時，$f(0)=-E<0$；搜尋完成時 $f(tU)\ge0$。連續函數在這個範圍內有零點，`uniroot` 以內部求根演算法縮小範圍，並非固定每次只做簡單二分。`$root` 取時間答案，`tol=1e-8` 是求根的容許精度，與積分容許精度用途不同。本版補 `check.conv=TRUE`，避免求根未收斂卻只警告並繼續使用近似答案。[R uniroot 文件](https://stat.ethz.ch/R-manual/R-devel/library/stats/html/uniroot.html)
-
-若已知 $E\ge A_\infty$，直接回傳 `Inf` 才有模型依據。若只是在 `t_upper_max` 前沒找到，便中止，而不是把找不到解硬改成 `Inf`。`A_inf=NULL` 只表示不知道上限；`A_inf=Inf` 才表示知道累積風險沒有有限上限。積分仍可能在極端參數或很大區間出現數值問題，增加上限並不能保證解決；本次未做數值驗證。
-
-以下保留原始主流程，只補輸入檢查、明列絕對積分容許誤差，以及求根收斂／結果檢查。
 
 ```r
 cox_exp <- function(id, shape, scale, eta_fun,
@@ -163,13 +137,13 @@ cox_exp <- function(id, shape, scale, eta_fun,
 
 ### 先生成個體差異，再把個體差異帶進風險
 
-`n=5000` 是病人人數。`Z` 存每個人的不隨時間改變共變數；預設 `rbinom(n,1,0.5)` 生成 0 或 1。`b` 是 n 列、2 欄的矩陣，每列一位病人。`MASS::mvrnorm` 依 `D` 生成相關的隨機截距 `b0`、隨機斜率 `b1`。
+`n=5000` 是病人人數。`Z` 不隨時間改變共變數；預設 `rbinom(n,1,0.5)` 。`MASS::mvrnorm` 依 `D` 生成相關的隨機截距 `b0`、隨機斜率 `b1`。
 
-`D` 的兩個變異數都是 0.5，標準差為 $\sqrt{0.5}\approx0.7071$；共變異數 0.01 對應相關係數 0.02。不是把 0.01 當成相關係數。`byrow=TRUE` 表示把提供的四個數字按列填進矩陣。
+`D` 的兩個變異數都是 0.5，標準差為 $\sqrt{0.5}\approx0.7071$；共變異數 0.01 對應相關係數 0.02。
 
 $$m_i(t)=(2+b_{0i})+(-0.5+b_{1i})t,\quad y_i(t)=m_i(t)+\epsilon_i(t),\quad\epsilon_i(t)\sim N(0,0.1^2).$$
 
-`m_it` 儲存真實軌跡函數，`eta_fun` 儲存 $\eta_i(t)=\gamma Z_i+\alpha m_i(t)$。其中 `beta_fix` 是指標的固定截距／斜率，`alpha=2.5` 是指標對風險的關聯強度，`gamma=1` 是 Z 對風險的係數，三者不能混用。指標誤差不直接放進事件生成公式。
+`m_it` 儲存真實軌跡函數，`eta_fun` 儲存 $\eta_i(t)=\gamma Z_i+\alpha m_i(t)$。其中 `beta_fix` 是指標的固定截距／斜率，`alpha=2.5` 是指標對風險的關聯強度，`gamma=1` 是 Z 對風險的係數。
 
 ### 為什麼這裡要另外算 A_inf
 
