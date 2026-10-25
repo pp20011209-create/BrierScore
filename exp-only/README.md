@@ -193,14 +193,20 @@ Z <- if (Z_dist == "binom") rbinom(n, 1, 0.5) else rnorm(n)
 在 exp 基線及直線型指標軌跡下，個人風險可寫為：
 $$h_i(t)=\text{base}_i\exp(\text{slope}_i t).$$
 其中，base 是時間零的個人風險率，slope 是線性預測值隨時間變化的斜率。總累積風險為：
-$$A_i(\infty)=\begin{cases}\text{base}_i/(-\text{slope}_i), & \text{slope}_i<0,\\
-\infty, & \text{slope}_i\ge 0.
-\end{cases}$$
+$$
+A_i(\infty)=
+\begin{cases}
+\dfrac{\mathrm{base}_i}{-\mathrm{slope}_i}, & \mathrm{slope}_i<0,\\
+\infty, & \mathrm{slope}_i\ge 0.
+\end{cases}
+$$
 將此上限傳入 cox_exp。若抽取的累積風險門檻不低於有限上限，真實事件時間記為 Inf；其餘情況使用數值積分與求根取得有限事件時間。
 最後生成設限時間，建立觀察時間與事件指標：
-C_i=\min(C_{ind,i},\texttt{admin_tau}),\qquad
+$$
+C_i=\min(C_{\mathrm{ind},i},\texttt{admin_tau}),\qquad
 X_i=\min(T_i,C_i),\qquad
 \delta_i=I(T_i\le C_i).
+$$
 
 ```r
   # 此處的累積風險上限公式限於 exp 基線
@@ -252,9 +258,9 @@ X_i=\min(T_i,C_i),\qquad
 
 ### 03d｜保留追蹤期間的量測
 
-visit_grid 為 0、0.2、…、2，共 11 個預定量測時點。keep_rule 決定是否保留結束追蹤當下的量測。t_i 是第 i 人保留下來的時間，mu 是對應的潛在指標，y_i 加入獨立常態誤差。
+visit_grid 為 0、0.2、…、2，共 11 個預定量測時點。t_i 是第 i 人保留下來的時間，mu 是對應的潛在指標，y_i 加入獨立常態誤差。
 
-long_list 逐人存放量測表；每人觀察時間不同，因此列數可以不同。next 表示沒有量測可保留時跳到下一人。最後量測時間 2 與行政追蹤截止時間 30 是不同設定。
+long_list 逐人存放量測表；每人觀察時間不同，因此列數可以不同。
 
 ```r
 long_list <- vector("list", n)
@@ -275,8 +281,7 @@ long_list <- vector("list", n)
 
 do.call(rbind,long_list) 按列合併各人的量測。long_df 為一人多列，surv_df 為一人一列。long 的 time 是量測時間，surv 的 time 是事件或設限時間。
 
-censoring_rate 由實際 event=0 的比例計算。settings 保存生成參數與自訂基線函數，供結果追溯。後續模型與 IPCW 使用 time、event、Z 和量測歷史，不使用 Ttrue 或 C 作為預測特徵。
-
+censoring_rate 由實際 event=0 的比例計算。
 ```r
 long_df <- if (any(!vapply(long_list, is.null, logical(1)))) {
     do.call(rbind, long_list)
@@ -285,20 +290,13 @@ long_df <- if (any(!vapply(long_list, is.null, logical(1)))) {
   }
   surv_df <- data.frame(id = seq_len(n), time = time, event = event,
                         Z = Z, Ttrue = T_true, C = C)
-  list(long = long_df, surv = surv_df, censoring_rate = mean(event == 0),
-       settings = list(n = n, visit_grid = visit_grid, beta_fix = beta_fix,
-                       D = D, sigma_y = sigma_y, Z_dist = Z_dist,
-                       gamma = gamma, alpha = alpha, shape = shape, scale = scale,
-                       admin_tau = admin_tau, cens_rate = cens_rate, keep_rule = keep_rule,
-                       haz0_fun = haz0_fun))
+  list(long = long_df, surv = surv_df, censoring_rate = mean(event == 0))
 }
 ```
 
-## 04｜生成一份固定的 exp 情境資料
+## 04｜生成一份固定的 exp 資料
 
-本段執行資料生成；前面的函數定義本身不會產生樣本。set.seed 固定亂數起點；sim 儲存回傳清單，long、surv 取出兩張表。head 只顯示前幾列；N=5000 對應 nrow(surv)，不是量測表總列數。
-
-四個模型使用這同一份資料。更換抽亂數順序後，即使種子相同，也不應期待與舊版生成完全相同的逐人資料。本版先抽 C 再抽事件門檻，因此與舊版數值結果需分開記錄。
+執行資料生成。sim 儲存回傳清單，long、surv 取出兩張表。N=5000 對應 nrow(surv)，不是量測表總列數。
 
 ```r
 set.seed(2025)
@@ -335,10 +333,6 @@ stopifnot(all(long$Z == surv$Z[ix]), all(long$time <= surv$time[ix]))
 
 lmefit 配適固定效果 y~time+Z，以及每人的隨機截距、隨機斜率。公式中的 |id 表示按病人分組；生成端未包含 Z 對指標的直接作用，因此縱向 Z 係數的真值為 0。
 
-coxfit_weibull 僅是 Cox 初始物件的名稱。coxph 在這一步沒有指定 Weibull 基線；後續 jointModel 才指定基線形式。x=TRUE、model=TRUE 保留模型所需資訊；cluster=id 的 Cox 穩健變異數設定不表示最終聯合模型自動使用同樣的穩健標準誤。
-
-coxfit_exp 使用相同初始物件，兩個最終 joint 模型仍會分別估計。
-
 ```r
 lmefit <- nlme::lme(
   y ~ time + Z, random = ~ time | id, data = long,
@@ -348,16 +342,17 @@ coxfit_weibull <- survival::coxph(
   Surv(time, event) ~ Z, data = surv,
   cluster = id, x = TRUE, model = TRUE, na.action = na.fail
 )
-coxfit_exp <- coxfit_weibull
-stopifnot(identical(unique(as.character(lmefit$groups[[1]])),
-                    as.character(coxfit_weibull$model[["(cluster)"]])))
+coxfit_exp <- coxph(
+  Surv(time, event) ~ Z,data = surv,
+  cluster = id,x = TRUE,model = TRUE
+)
 ```
 
 ## 06｜exp 與 Weibull 聯合模型
 
-parameterization="value" 表示風險連結當下潛在指標值。weibull-PH-aGH 指定 Weibull PH 及自適應高斯–埃米特積分，用於對未觀察隨機效果的概似積分；與第 02 段對時間的積分不同。
+weibull-PH-aGH 指定 Weibull PH 及自適應高斯–埃米特積分，用於對未觀察隨機效果的概似積分。
 
-exp 配適透過 scaleWB=1 固定相關 Weibull 參數為 1，使基線為常數；這是配適模型的限制，不是資料生成演算法的解析特例，也不是生成尺度 scale=100。Weibull 配適則讓形狀由資料估計。jointfit_exp 與 jointfit_weibull 分別保存兩個結果。[JM jointModel 文件](https://search.r-project.org/CRAN/refmans/JM/html/jointModel.html)
+exp 配適透過 scaleWB=1 固定相關 Weibull 參數為 1。Weibull 配適則讓形狀由資料估計。jointfit_exp 與 jointfit_weibull 分別保存兩個結果。
 
 ```r
 jm_control <- list()
@@ -385,9 +380,9 @@ print(summary(jointfit_weibull))
 
 ### 07a｜估計分位數與節點
 
-ln0 是只有截距的 lognormal 存活模型，用於挑選節點。mu_hat_ln、sd_hat_ln 是 log 時間的位置與尺度。probs 是四個分位機率 0.1、約 0.3667、約 0.6333、0.9；qlnorm 換算成時間分位數。
+ln0 是只有截距的 lognormal 存活模型，用於挑選節點。mu_hat_ln、sd_hat_ln 是 log 時間的位置與尺度。qlnorm 換算成時間分位數。
 
-knots_ln 僅保留觀察時間範圍內的有限節點，排序並去除重複值。此初步參數模型不含指標關聯，並非最終聯合模型。
+knots_ln 僅保留觀察時間範圍內的有限節點，排序並去除重複值。
 
 ```r
 ln0 <- survival::survreg(Surv(time, event) ~ 1, data = surv, dist = "lognormal")
@@ -402,10 +397,9 @@ if (!length(knots_ln)) stop("沒有可用的 lognormal 內部節點。")
 
 ### 07b｜配適樣條聯合模型
 
-baseHaz="regression-splines" 決定最終基線為樣條，knots 指定內部節點，ordSpline=4 表示三次樣條。ObsTimes.knots 是套件自動選節點時的設定；本段已明確傳入分位數節點。
+baseHaz="regression-splines" 決定最終基線為樣條，knots 指定內部節點，ordSpline=4 表示三次樣條
 
-n.iter 為總迭代數，n.burnin 為前段捨棄次數，n.thin 為抽稀間距。seed 在 control 明確指定套件使用的亂數種子。摘要輸出不等於完成 MCMC 收斂診斷。[JMbayes 文件](https://search.r-project.org/CRAN/refmans/JMbayes/html/jointModelBayes.html)
-
+n.iter 為總迭代數，n.burnin 為前段捨棄次數，n.thin 為抽稀間距。
 ```r
 set.seed(2025)
 jm_spline_lnknots <- JMbayes::jointModelBayes(
@@ -422,11 +416,9 @@ print(summary(jm_spline_lnknots))
 
 ### 08a｜loglogistic 分位數
 
-ll0 為只有截距的 loglogistic 存活模型。log 時間採 logistic 的位置–尺度表達式，時間分位數為
+log 時間採 logistic 的位置–尺度表達式，時間分位數為
 
 $$Q_T(p)=\exp\{\hat\mu+\hat\sigma\,Q_{\mathrm{logistic}}(p)\}.$$
-
-mu_hat_ll 是位置，sd_hat_ll 雖保留 sd 名稱，實際是 logistic scale，不是標準差。qlogis 提供標準 logistic 分位數，knots_ll 儲存轉換後的時間節點。此步驟使用既有 exp 情境資料，沒有重新生成 loglogistic 資料。
 
 ```r
 ll0 <- survival::survreg(Surv(time, event) ~ 1, data = surv, dist = "loglogistic")
@@ -462,12 +454,13 @@ $$\hat p_i(s,t)=\widehat P(T_i>t\mid T_i>s,\mathcal Y_i(s),Z_i),\qquad t=s+\Delt
 
 s=Tstart 為起點，t=Thoriz 為終點，$\mathcal Y_i(s)$ 為起點以前的指標歷史。模型使用同一份配適結果，隨起點更新個人的條件資訊。
 
+已配適的 joint 模型 + 指定病人在預測起點以前的量測 + 預測起點、預測終點 -> survfitJM() -> 每位病人的條件存活機率 S_hat
+
 ### 09a｜依時間與欄名取預測機率
 
-m 是某人的預測摘要表，row 找出對應終點的列號。使用 times、predSurv 欄名，避免取錯欄位；時間比較允許極小的浮點誤差。機率須有限且介於 0 與 1。
+m 是某人的預測摘要表，row 找出對應終點的列號。機率須有限且介於 0 與 1。
 
 ```r
-# 按時間與欄名取機率，不猜「第一列第二欄」，也不刪除預測失敗者。
 extract_survprob <- function(m, Thoriz, id) {
   if (is.data.frame(m)) m <- as.matrix(m)
   if (!is.matrix(m) || !all(c("times", "predSurv") %in% colnames(m)))
@@ -479,8 +472,8 @@ extract_survprob <- function(m, Thoriz, id) {
   p
 }
 
-# JM 用逐人呼叫；JMbayes 保留原作者的批次預測形式。
-# 本教材明確固定 simulate=FALSE：兩者都是 plug-in，但參數估計來源不同。
+# JM 用逐人呼叫；JMbayes 保留批次預測形式。
+# 固定 simulate=FALSE：兩者都是 plug-in，但參數估計來源不同。
 ```
 
 ### 09b｜準備起點以前的資料
@@ -502,8 +495,6 @@ get_S_hat <- function(jointfit, long_df, ids, Tstart, Thoriz) {
 
 inherits 判斷模型類別。JMbayes 分支一次傳入多位病人的量測歷史；sf 為預測物件，sm 為每人摘要清單。依病人名稱取出摘要，避免回傳順序不同而配錯人。
 
-simulate=FALSE 使用代入式預測，沒有完整抽樣平均所有參數不確定性。
-
 ```r
 if (inherits(jointfit, "JMbayes")) {
     sf <- JMbayes::survfitJM(jointfit, newdata = di, idVar = "id",
@@ -520,9 +511,9 @@ if (inherits(jointfit, "JMbayes")) {
 
 ### 09d｜JM 的逐人預測與回傳
 
-JM 分支逐人呼叫 survfitJM。此設定在估計參數下使用個人隨機效果的經驗貝氏後驗眾數進行代入式預測；配適階段的 aGH 與此處個人效果的估計步驟不同。
+JM 分支逐人呼叫 survfitJM。此設定在估計參數下使用個人隨機效果的經驗貝氏後驗眾數進行代入式預測。
 
-函數最後回傳 S_hat。預測失敗會停止，不刪除該人或填入固定機率。
+函數最後回傳 S_hat。
 
 ```r
 } else if (inherits(jointfit, "jointModel")) {
@@ -544,12 +535,12 @@ JM 分支逐人呼叫 survfitJM。此設定在估計參數下使用個人隨機�
 
 ### 10a｜風險集與機率對齊
 
-只納入 $X_i>s$ 且起點以前有量測資料的人，形成 $\mathcal R_s$。R 是其存活資料表，n_risk 是人數 $n_s$。n_no_history 記錄因缺少歷史而未納入的人；若非零，評估族群限於具備歷史資料者。
+只納入 $X_i>s$ 且起點以前有量測資料的人，形成 $\mathcal R_s$。R 是其存活資料表，n_risk 是人數 $n_s$。
 
 S_hat 依 R 的 id 順序重新對齊。預測時不使用起點以後的指標，觀察結局則用於後續評分。
 
 ```r
-# 一個起點、一個終點的評分：條件反向 KM + 三種 IPCW 貢獻。
+# 一個起點、一個終點的評分：條件反向 KM +  IPCW 貢獻。
 brier_ipcw <- function(jointfit, long_df, surv_df, Tstart, Thoriz, min_G = 0.05) {
   stopifnot(length(Tstart) == 1L, is.finite(Tstart), Tstart > 0,
             length(Thoriz) == 1L, is.finite(Thoriz), Thoriz > Tstart,
@@ -579,9 +570,9 @@ brier_ipcw <- function(jointfit, long_df, surv_df, Tstart, Thoriz, min_G = 0.05)
 | $X_i>t$ | alive | 1 | $1/\hat G_s(t)$ |
 | $s<X_i\le t,\delta_i=0$ | unknown | 未知 | 0 |
 
-Surv(time,1-event) 以設限作為 KM 的事件、真正事件作為 KM 的設限，估計設限存活機率。輸入已是起點後仍被追蹤者，因此在本分析的獨立設限設定下，直接估計條件 G_s，不再額外乘 G(s)。
+Surv(time,1-event) 以設限作為 KM 的事件、真正事件作為 KM 的設限，估計設限存活機率。
 
-G_step 依 KM 跳點查值：left=TRUE 使用嚴格小於，得到事件前一瞬間的左極限；一般查終點用小於等於。在相鄰跳點之間保持上一個 KM 值，這與累積風險的積分面積無關。
+G_step 依 KM 跳點查值：left=TRUE 使用嚴格小於，得到事件前一瞬間的左極限；一般查終點用小於等於。在相鄰跳點之間保持上一個 KM 值。
 
 ```r
 dead <- R$event == 1 & R$time <= Thoriz
@@ -605,8 +596,6 @@ $$\widehat{BS}(s,t)=\frac1{n_s}\sum_{i\in\mathcal R_s}
 \right].$$
 
 contrib 儲存每人的貢獻，unknown 留為 0，但仍留在分母 n_risk。分母不是已知結局的人數，也不是權重總和。min_G=0.05 是本實作的支持度停止門檻，不是將較小的 G 裁切到 0.05。
-
-共同 KM 依賴設限獨立與權重分母為正等條件；若設限依賴病人特徵或指標歷史，需相應的條件設限模型。此分析先不另輸出逐人權重表，但計分過程仍使用上述權重。
 
 ```r
 G_ti <- G_step(R$time[dead], left = TRUE)
@@ -632,7 +621,7 @@ brier_grid 對每個 Tstarts 執行同一個評分步驟。j 為起點索引，s
 每個起點重新選人、讀取歷史、計算條件預測與 KM 權重。不重新配適 joint 模型，不沿用前次預測機率，也不累加前次 Brier。tryCatch 補上出錯起點與終點後停止，避免默默略過失敗的時間。
 
 ```r
-# 外層迴圈沿用原作者方向：移動 Tstart，固定 Dt；不重新配適模型。
+# 移動 Tstart，固定 Dt；不重新配適模型。
 brier_grid <- function(jointfit, long_df, surv_df, Tstarts, Dt, min_G = 0.05) {
   stopifnot(length(Tstarts) > 0L, all(is.finite(Tstarts)), all(Tstarts > 0),
             all(diff(Tstarts) > 0), length(Dt) == 1L, is.finite(Dt), Dt > 0)
@@ -653,13 +642,7 @@ brier_grid <- function(jointfit, long_df, surv_df, Tstarts, Dt, min_G = 0.05) {
 
 ## 12｜四個模型的完整時間網格與輸出
 
-fits 是四個模型清單，lapply 對每個模型套用相同時間網格與評分函數。tables 保存四張評分表，comparison 上下合併並加上 model 標籤。
-
-起點由 0.0001 開始，每次增加 0.2，共 12 個，最後起點為 2.2001，終點為 2.4001。近零起點不完全等於 0。起點超過最後量測時間 2 後仍可預測，但沒有新指標量測可加入。
-
-每列代表一個模型在指定窗口的群體平均誤差，且 n_event+n_alive+n_unknown=n_risk。Brier 不要求隨起點單調下降；不同起點的評估族群不同，後期風險集較小。真實 exp 也不保證單次樣本的每個分數都低於 Weibull。
-
-結果另存 exp-only/results；同名輸出在重跑時會覆寫。此處是樣本內、單次模擬評分，尚未加入獨立評估、重複模擬或 IBS。
+起點由 0.0001 開始，每次增加 0.2，共 12 個，最後起點為 2.2001，終點為 2.4001。近零起點不完全等於 0。
 
 ```r
 Tstarts <- seq(0.0001, 2.4, by = 0.2)
@@ -681,94 +664,6 @@ comparison <- do.call(rbind, lapply(names(tables), function(name) {
 rownames(comparison) <- NULL
 print(comparison, digits = 10, row.names = FALSE)
 
-output_dir <- "exp-only/results"
-dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
-write.csv(comparison, file.path(output_dir, "brier_comparison.csv"), row.names = FALSE)
-saveRDS(list(settings = sim$settings, fits = fits, tables = tables),
-        file.path(output_dir, "analysis.rds"))
-capture.output(sessionInfo(), file = file.path(output_dir, "sessionInfo.txt"))
 ```
 
 <a id="switch-baseline"></a>
-## 13｜生成基線的替換介面
-
-本版的數值核心只需要非負、在有限追蹤區間局部可積分的基線風險，以及可在積分節點求值的 eta_fun。更換基線時保留有限追蹤、積分、求根與右設限邏輯；不需推導每個分布的無限時間累積風險上限。數值穩定性仍須依新模型檢查。傳入 haz0_fun 後，基線參數由該函數決定；simulate_cox_exp 的 shape、scale 不會自動改變自訂函數的參數。
-
-以下是替代第 04 段的生成設定，並非在四個配適模型之間執行。生成新資料後須重新建立 long、surv 及所有配適與評分物件。函數保留 simulate_cox_exp 的歷史名稱，但可接受其他基線。
-
-### Weibull 基線
-
-未提供 haz0_fun 時使用 haz0_weibull。shape=1.5、scale=100 為示範設定，不代表論文設定。形狀與尺度改變後，後面的配適模型仍可保留同樣四種，比較另一個生成情境。
-
-```r
-sim <- simulate_cox_exp(n = 5000, shape = 1.5, scale = 100)
-long <- sim$long
-surv <- sim$surv
-```
-
-### Lognormal 基線
-
-基線風險為密度除以存活函數。以 log 密度減 log 存活機率計算，減少尾端直接相除的數值問題；u=0 時設定其風險極限 0。meanlog=2.5、sdlog=1 是 log 時間參數。其他參數在此仍沿用本版預設；若重現不同論文情境，須一併核對 alpha、設限 rate 等設定。
-
-```r
-haz0_lognormal <- function(u, meanlog = 2.5, sdlog = 1) {
-  stopifnot(all(is.finite(u)), all(u >= 0),
-            length(meanlog) == 1L, is.finite(meanlog),
-            length(sdlog) == 1L, is.finite(sdlog), sdlog > 0)
-  out <- numeric(length(u))
-  positive <- u > 0
-  out[positive] <- exp(
-    dlnorm(u[positive], meanlog, sdlog, log = TRUE) -
-      plnorm(u[positive], meanlog, sdlog, lower.tail = FALSE, log.p = TRUE)
-  )
-  out
-}
-sim <- simulate_cox_exp(n = 5000, haz0_fun = haz0_lognormal)
-long <- sim$long
-surv <- sim$surv
-```
-
-### Loglogistic 基線
-
-基線風險為 $(k/a)(u/a)^{k-1}/[1+(u/a)^k]$。正時間使用 log 尺度計算；原點依形狀指定極限。shape=2、scale=10 為示範設定。
-
-```r
-haz0_loglogistic <- function(u, shape = 2, scale = 10) {
-  stopifnot(all(is.finite(u)), all(u >= 0),
-            length(shape) == 1L, is.finite(shape), shape > 0,
-            length(scale) == 1L, is.finite(scale), scale > 0)
-  out <- numeric(length(u))
-  positive <- u > 0
-  z <- shape * (log(u[positive]) - log(scale))
-  log_denom <- pmax(z, 0) + log1p(exp(-abs(z)))
-  out[positive] <- exp(log(shape) - log(scale) +
-    (shape - 1) * (log(u[positive]) - log(scale)) - log_denom)
-  out[!positive] <- if (shape < 1) Inf else if (shape == 1) 1 / scale else 0
-  out
-}
-sim <- simulate_cox_exp(n = 5000, haz0_fun = haz0_loglogistic)
-long <- sim$long
-surv <- sim$surv
-```
-
-上述示例只改變生成端；樣條 PH 的 lognormal／loglogistic 標籤仍是選節點方式。改變 m_it 時亦須核對縱向配適結構；有限期間積分不再依賴直線斜率公式，但配適模型不會自動跟著更改。
-
-## 執行與範圍
-
-從 repository 根目錄執行以下程式。獨立環境保存物件，避免覆蓋既有同名資料；套件載入與種子仍作用於同一個 R 工作階段。完整程式一次執行全部模型與時間網格。
-
-```r
-exp_demo <- new.env(parent = globalenv())
-source("exp-only/analysis.R", local = exp_demo, encoding = "UTF-8")
-exp_demo$comparison
-```
-
-本版未執行模型、數值測試或 MCMC 收斂診斷。有限期間方法生成的是右設限觀察資料，不提供設限者完整的潛在事件時間；需要完整 T 的後續研究須另設計生成程序。
-
-## 方法與程式文件
-
-- [R integrate](https://stat.ethz.ch/R-manual/R-devel/library/stats/html/integrate.html)：自適應積分、誤差與區間設定。
-- [R uniroot](https://stat.ethz.ch/R-manual/R-devel/library/stats/html/uniroot.html)：求根區間與收斂設定。
-- [JM jointModel](https://search.r-project.org/CRAN/refmans/JM/html/jointModel.html)：聯合模型方法與控制參數。
-- [JM survfitJM](https://search.r-project.org/CRAN/refmans/JM/html/survfitJM.html)：條件存活預測。
-- [JMbayes jointModelBayes](https://search.r-project.org/CRAN/refmans/JMbayes/html/jointModelBayes.html)：樣條基線、節點與 MCMC 設定。
