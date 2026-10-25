@@ -190,9 +190,15 @@ Z <- if (Z_dist == "binom") rbinom(n, 1, 0.5) else rnorm(n)
 ### 03c｜真實事件時間與右設限資料
 
 先根據個人的風險函數生成真實事件時間，再獨立生成設限時間。
+
 在 exp 基線及直線型指標軌跡下，個人風險可寫為：
-$$h_i(t)=\text{base}_i\exp(\text{slope}_i t).$$
+
+$$
+h_i(t)=\mathrm{base}_i\exp\left(\mathrm{slope}_i\,t\right).
+$$
+
 其中，base 是時間零的個人風險率，slope 是線性預測值隨時間變化的斜率。總累積風險為：
+
 $$
 A_i(\infty)=
 \begin{cases}
@@ -200,14 +206,16 @@ A_i(\infty)=
 \infty, & \mathrm{slope}_i\ge 0.
 \end{cases}
 $$
+
 將此上限傳入 cox_exp。若抽取的累積風險門檻不低於有限上限，真實事件時間記為 Inf；其餘情況使用數值積分與求根取得有限事件時間。
+
 最後生成設限時間，建立觀察時間與事件指標：
+
 $$
-C_i=\min(C_{\mathrm{ind},i},\texttt{admin_tau}),\qquad
+C_i=\min\left(C_{\mathrm{ind},i},\texttt{admin\_tau}\right),\qquad
 X_i=\min(T_i,C_i),\qquad
 \delta_i=I(T_i\le C_i).
 $$
-
 ```r
   # 此處的累積風險上限公式限於 exp 基線
   if (length(shape) != 1L ||
