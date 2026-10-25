@@ -10,51 +10,54 @@ library(survival)
 library(JM)
 library(JMbayes)
 
-haz0_weibull <- function(t, shape, scale, eps = 1e-12) {
+haz0_weibull <- function(t, shape, scale) {
   if (length(shape) != 1L || !is.finite(shape) || shape <= 0 ||
       length(scale) != 1L || !is.finite(scale) || scale <= 0 ||
-      length(eps) != 1L || !is.finite(eps) || eps <= 0 ||
       any(!is.finite(t)) || any(t < 0)) {
-    stop("時間須非負且有限，shape、scale、eps 須為有限正數。")
+    stop("時間須非負且有限，shape、scale 須為有限正數。")
   }
-  tt <- pmax(t, eps)
-  (shape / scale) * (tt / scale)^(shape - 1)
+  if (shape == 1) return(rep(1 / scale, length(t)))
+  (shape / scale) * (t / scale)^(shape - 1)
 }
 
 # ==== BLOCK 02 ====
-cox_exp <- function(id, shape, scale, eta_fun,
+# ---- PART 02a ----
+cox_exp <- function(id, shape, scale, eta_fun, censor_time,
                     t_upper_init = 10,
-                    t_upper_max = 1e6,
-                    eps = 1e-12,
                     rel.tol = 1e-8,
                     subdivisions = 2000L,
-                    A_inf = NULL,
                     haz0_fun = NULL) {
   if (is.null(haz0_fun)) {
-    haz0_fun <- function(u) haz0_weibull(u, shape, scale, eps = eps)
+    haz0_fun <- function(u) haz0_weibull(u, shape, scale)
   }
   if (!is.function(haz0_fun) || !is.function(eta_fun)) {
     stop("haz0_fun 與 eta_fun 必須是函數。")
   }
   if (length(t_upper_init) != 1L || !is.finite(t_upper_init) || t_upper_init <= 0)
     stop("t_upper_init 必須是單一、有限且大於 0 的數值。")
-  if (length(t_upper_max) != 1L || !is.finite(t_upper_max) || t_upper_max < t_upper_init)
-    stop("t_upper_max 必須有限，且不得小於 t_upper_init。")
+  if (length(censor_time) != 1L || !is.finite(censor_time) || censor_time <= 0)
+    stop("censor_time 必須是單一、有限且大於 0 的設限時間。")
   if (length(rel.tol) != 1L || !is.finite(rel.tol) || rel.tol <= 0 ||
       length(subdivisions) != 1L || !is.finite(subdivisions) ||
       subdivisions < 1 || subdivisions != floor(subdivisions))
     stop("rel.tol 須為正數，subdivisions 須為正整數。")
-  if (!is.null(A_inf)) {
-    if (length(A_inf) != 1L || is.na(A_inf) || A_inf <= 0)
-      stop("A_inf 必須是正數或 Inf。")
-  }
 
+# ---- PART 02b ----
   A <- function(t) {
     if (length(t) != 1L || !is.finite(t) || t < 0)
       stop("A(t) 的 t 必須是單一、有限且非負的數值。")
     if (t == 0) return(0)
     val <- integrate(
-      function(u) haz0_fun(u) * exp(eta_fun(u, id)),
+      function(u) {
+        h0 <- haz0_fun(u)
+        eta <- eta_fun(u, id)
+        if (length(h0) != length(u) || length(eta) != length(u) ||
+            any(!is.finite(h0)) || any(h0 < 0) || any(!is.finite(eta)))
+          stop("風險函數須對每個積分時間回傳合法值。")
+        h <- h0 * exp(eta)
+        if (any(!is.finite(h))) stop("個人風險超出數值範圍。")
+        h
+      },
       lower = 0, upper = t,
       rel.tol = rel.tol, abs.tol = rel.tol,
       subdivisions = subdivisions, stop.on.error = TRUE
@@ -64,27 +67,28 @@ cox_exp <- function(id, shape, scale, eta_fun,
     val
   }
 
+# ---- PART 02c ----
   E <- rexp(1)
   if (!is.finite(E) || E <= 0) stop("抽到無效的累積風險門檻。")
-  if (!is.null(A_inf) && E >= A_inf) return(Inf)
   f <- function(t) A(t) - E
-  tU <- t_upper_init
+  tU <- min(t_upper_init, censor_time)
   fu <- f(tU)
   while (fu < 0) {
-    if (tU >= t_upper_max) {
-      stop("病人 ", id, "：搜尋上限內仍未找到事件時間；",
-           "請檢查搜尋範圍、積分結果與累積風險上限。")
+    if (tU >= censor_time) {
+      return(list(time = censor_time, event = 0L, Ttrue = NA_real_))
     }
-    tU <- min(tU * 2, t_upper_max)
+    tU <- min(tU * 2, censor_time)
     fu <- f(tU)
   }
+# ---- PART 02d ----
   ans <- uniroot(f, interval = c(0, tU), tol = 1e-8, check.conv = TRUE)$root
-  if (!is.finite(ans) || ans <= 0)
+  if (!is.finite(ans) || ans <= 0 || ans > censor_time)
     stop("病人 ", id, "：有限事件時間計算失敗。")
-  ans
+  list(time = ans, event = 1L, Ttrue = ans)
 }
 
 # ==== BLOCK 03 ====
+# ---- PART 03a ----
 simulate_cox_exp <- function(
     n = 5000,
     visit_grid = seq(0, by = 0.2, length.out = 11),
@@ -94,11 +98,11 @@ simulate_cox_exp <- function(
     gamma = 1.0, alpha = 2.5,
     shape = 1.0, scale = 100.0,
     admin_tau = 30, cens_rate = 1.6,
-    keep_rule = c("<", "<=")) {
+    keep_rule = c("<", "<="), haz0_fun = NULL) {
   Z_dist <- match.arg(Z_dist)
   keep_rule <- match.arg(keep_rule)
   stopifnot(length(n) == 1L, is.finite(n), n >= 2, n == floor(n),
-            length(shape) == 1L, is.finite(shape), shape == 1,
+            length(shape) == 1L, is.finite(shape), shape > 0,
             length(scale) == 1L, is.finite(scale), scale > 0,
             length(beta_fix) == 2L, all(is.finite(beta_fix)),
             is.matrix(D), all(dim(D) == c(2, 2)), all(is.finite(D)),
@@ -111,6 +115,7 @@ simulate_cox_exp <- function(
             length(visit_grid) > 0L, all(is.finite(visit_grid)),
             visit_grid[1] == 0, all(diff(visit_grid) > 0))
 
+# ---- PART 03b ----
   Z <- if (Z_dist == "binom") rbinom(n, 1, 0.5) else rnorm(n)
   b <- MASS::mvrnorm(n, mu = c(0, 0), Sigma = D)
   colnames(b) <- c("b0", "b1")
@@ -119,28 +124,22 @@ simulate_cox_exp <- function(
   }
   eta_fun <- function(t, id) gamma * Z[id] + alpha * m_it(t, id)
 
-  T_true <- rep(NA_real_, n)
-  for (i in seq_len(n)) {
-    eta0 <- eta_fun(0, i)
-    slope <- alpha * (beta_fix[2] + b[i, "b1"])
-    if (!is.finite(eta0) || !is.finite(slope)) stop("風險參數不合法。")
-    A_inf <- Inf
-    if (slope < 0) {
-      log_A_inf <- eta0 - log(scale) - log(-slope)
-      A_inf <- exp(log_A_inf)
-      if (!is.finite(A_inf) || A_inf <= 0)
-        stop("病人 ", i, "：有限累積風險上限超出可表示的數值範圍。")
-    }
-    T_true[i] <- cox_exp(
-      id = i, shape = shape, scale = scale, eta_fun = eta_fun,
-      t_upper_init = admin_tau, A_inf = A_inf
-    )
-  }
-
+# ---- PART 03c ----
   Cind <- rexp(n, rate = cens_rate)
   C <- pmin(Cind, admin_tau)
-  time <- pmin(T_true, C)
-  event <- as.integer(is.finite(T_true) & T_true <= C)
+  time <- rep(NA_real_, n)
+  event <- rep(NA_integer_, n)
+  T_true <- rep(NA_real_, n)
+  for (i in seq_len(n)) {
+    obs_i <- cox_exp(
+      id = i, shape = shape, scale = scale, eta_fun = eta_fun,
+      censor_time = C[i], t_upper_init = 10, haz0_fun = haz0_fun
+    )
+    time[i] <- obs_i$time
+    event[i] <- obs_i$event
+    T_true[i] <- obs_i$Ttrue
+  }
+# ---- PART 03d ----
   long_list <- vector("list", n)
   for (i in seq_len(n)) {
     if (keep_rule == "<") {
@@ -153,6 +152,7 @@ simulate_cox_exp <- function(
     y_i <- mu + rnorm(length(t_i), 0, sigma_y)
     long_list[[i]] <- data.frame(id = i, time = t_i, y = y_i, Z = Z[i])
   }
+# ---- PART 03e ----
   long_df <- if (any(!vapply(long_list, is.null, logical(1)))) {
     do.call(rbind, long_list)
   } else {
@@ -164,7 +164,8 @@ simulate_cox_exp <- function(
        settings = list(n = n, visit_grid = visit_grid, beta_fix = beta_fix,
                        D = D, sigma_y = sigma_y, Z_dist = Z_dist,
                        gamma = gamma, alpha = alpha, shape = shape, scale = scale,
-                       admin_tau = admin_tau, cens_rate = cens_rate, keep_rule = keep_rule))
+                       admin_tau = admin_tau, cens_rate = cens_rate, keep_rule = keep_rule,
+                       haz0_fun = haz0_fun))
 }
 
 # ==== BLOCK 04 ====
@@ -178,6 +179,7 @@ print(data.frame(n_subjects = nrow(surv), n_measurements = nrow(long),
                  censoring_rate = sim$censoring_rate))
 
 # ==== BLOCK 05 ====
+# ---- PART 05a ----
 stopifnot(!anyNA(long$id), !anyNA(surv$id), !anyDuplicated(surv$id),
           setequal(long$id, surv$id), !anyDuplicated(long[c("id", "time")]),
           all(is.finite(long$y)), all(is.finite(long$time)),
@@ -190,6 +192,7 @@ surv <- surv[order(surv$id), ]
 ix <- match(long$id, surv$id)
 stopifnot(all(long$Z == surv$Z[ix]), all(long$time <= surv$time[ix]))
 
+# ---- PART 05b ----
 lmefit <- nlme::lme(
   y ~ time + Z, random = ~ time | id, data = long,
   na.action = na.fail, control = nlme::lmeControl(opt = "optim")
@@ -224,6 +227,7 @@ print(summary(jointfit_exp))
 print(summary(jointfit_weibull))
 
 # ==== BLOCK 07 ====
+# ---- PART 07a ----
 ln0 <- survival::survreg(Surv(time, event) ~ 1, data = surv, dist = "lognormal")
 mu_hat_ln <- as.numeric(coef(ln0))
 sd_hat_ln <- as.numeric(ln0$scale)
@@ -232,33 +236,38 @@ knots_ln <- qlnorm(probs, meanlog = mu_hat_ln, sdlog = sd_hat_ln)
 knots_ln <- sort(unique(knots_ln[is.finite(knots_ln) &
                                   knots_ln > min(surv$time) & knots_ln < max(surv$time)]))
 if (!length(knots_ln)) stop("沒有可用的 lognormal 內部節點。")
+# ---- PART 07b ----
 set.seed(2025)
 jm_spline_lnknots <- JMbayes::jointModelBayes(
   lmeObject = lmefit, survObject = coxfit_weibull,
   timeVar = "time", param = "td-value", baseHaz = "regression-splines",
   control = list(knots = knots_ln, ordSpline = 4, ObsTimes.knots = FALSE,
-                 n.iter = 12000, n.burnin = 2000, n.thin = 5)
+                 n.iter = 12000, n.burnin = 2000, n.thin = 5, seed = 2025)
 )
 print(summary(jm_spline_lnknots))
 
 # ==== BLOCK 08 ====
+# ---- PART 08a ----
 ll0 <- survival::survreg(Surv(time, event) ~ 1, data = surv, dist = "loglogistic")
+probs <- seq(0.1, 0.9, length.out = 4)
 mu_hat_ll <- as.numeric(coef(ll0))
 sd_hat_ll <- as.numeric(ll0$scale)
 knots_ll <- exp(mu_hat_ll + sd_hat_ll * qlogis(probs))
 knots_ll <- sort(unique(knots_ll[is.finite(knots_ll) &
                                   knots_ll > min(surv$time) & knots_ll < max(surv$time)]))
 if (!length(knots_ll)) stop("沒有可用的 loglogistic 內部節點。")
+# ---- PART 08b ----
 set.seed(2025)
 jm_spline_llknots <- JMbayes::jointModelBayes(
   lmeObject = lmefit, survObject = coxfit_weibull,
   timeVar = "time", param = "td-value", baseHaz = "regression-splines",
   control = list(knots = knots_ll, ordSpline = 4, ObsTimes.knots = FALSE,
-                 n.iter = 12000, n.burnin = 2000, n.thin = 5)
+                 n.iter = 12000, n.burnin = 2000, n.thin = 5, seed = 2025)
 )
 print(summary(jm_spline_llknots))
 
 # ==== BLOCK 09 ====
+# ---- PART 09a ----
 # 按時間與欄名取機率，不猜「第一列第二欄」，也不刪除預測失敗者。
 extract_survprob <- function(m, Thoriz, id) {
   if (is.data.frame(m)) m <- as.matrix(m)
@@ -273,6 +282,7 @@ extract_survprob <- function(m, Thoriz, id) {
 
 # JM 用逐人呼叫；JMbayes 保留原作者的批次預測形式。
 # 本教材明確固定 simulate=FALSE：兩者都是 plug-in，但參數估計來源不同。
+# ---- PART 09b ----
 get_S_hat <- function(jointfit, long_df, ids, Tstart, Thoriz) {
   stopifnot(length(ids) > 0L, !anyNA(ids), !anyDuplicated(ids),
             Tstart > 0, Thoriz > Tstart)
@@ -281,6 +291,7 @@ get_S_hat <- function(jointfit, long_df, ids, Tstart, Thoriz) {
   if (!all(ids %in% di$id)) stop("部分病人沒有起點以前的量測。")
   stopifnot(all(is.finite(di$time)), all(is.finite(di$y)), all(is.finite(di$Z)))
   S_hat <- setNames(rep(NA_real_, length(ids)), as.character(ids))
+# ---- PART 09c ----
   if (inherits(jointfit, "JMbayes")) {
     sf <- JMbayes::survfitJM(jointfit, newdata = di, idVar = "id",
                             last.time = Tstart, survTimes = Thoriz, simulate = FALSE)
@@ -292,6 +303,7 @@ get_S_hat <- function(jointfit, long_df, ids, Tstart, Thoriz) {
       i <- as.character(ids[k])
       S_hat[k] <- extract_survprob(sm[[i]], Thoriz, i)
     }
+# ---- PART 09d ----
   } else if (inherits(jointfit, "jointModel")) {
     for (k in seq_along(ids)) {
       i <- ids[k]
@@ -307,6 +319,7 @@ get_S_hat <- function(jointfit, long_df, ids, Tstart, Thoriz) {
 }
 
 # ==== BLOCK 10 ====
+# ---- PART 10a ----
 # 一個起點、一個終點的評分：條件反向 KM + 三種 IPCW 貢獻。
 brier_ipcw <- function(jointfit, long_df, surv_df, Tstart, Thoriz, min_G = 0.05) {
   stopifnot(length(Tstart) == 1L, is.finite(Tstart), Tstart > 0,
@@ -325,6 +338,7 @@ brier_ipcw <- function(jointfit, long_df, surv_df, Tstart, Thoriz, min_G = 0.05)
   S_hat <- unname(S_hat[as.character(R$id)])
   stopifnot(length(S_hat) == nrow(R), all(is.finite(S_hat)),
             all(S_hat >= 0 & S_hat <= 1))
+# ---- PART 10b ----
   dead <- R$event == 1 & R$time <= Thoriz
   alive <- R$time > Thoriz
   unknown <- !dead & !alive
@@ -335,6 +349,7 @@ brier_ipcw <- function(jointfit, long_df, surv_df, Tstart, Thoriz, min_G = 0.05)
       if (length(idx)) tail(km$surv[idx], 1) else 1
     }, numeric(1))
   }
+# ---- PART 10c ----
   G_ti <- G_step(R$time[dead], left = TRUE)
   G_t <- G_step(Thoriz)
   denom <- c(G_ti, if (any(alive)) G_t else numeric(0))

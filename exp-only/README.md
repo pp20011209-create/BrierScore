@@ -1,30 +1,31 @@
-# 真實基線為 exp ： 生成、配適與動態 Brier Score
+# 真實基線為 exp：生成、配適與動態 Brier Score
 
-研究問題：**生成一份真實基線為 exp 的資料，再把同一份資料交給不同模型，評估各自的動態 Brier score。** 不會每配適一個模型就重新抽一份資料，也不會隨機選擇生成基線。
+研究設計為生成一份真實基線為 exponential 的資料，再使用同一份資料配適不同聯合模型，比較固定預測跨度下的動態 Brier score。生成端採用有限追蹤期間內的數值積分與求根，可透過替換基線風險函數延伸至其他分布。
 
-| 表格名稱 | 真正配適的模型 |
-|---|---|
-| `exp_PH` | Weibull PH 固定形狀為 1，等價於 exp 基線 |
-| `weibull_PH` | Weibull PH，形狀由資料估計 |
-| `spline_PH_lognormal_knots` | lognormal 分位數選節點的樣條 PH |
-| `spline_PH_loglogistic_knots` | loglogistic 分位數選節點的樣條 PH |
+| 結果標籤 | 配適模型 | 估計方式 |
+|---|---|---|
+| exp_PH | Weibull PH 固定形狀為 1 | JM 最大概似 |
+| weibull_PH | Weibull PH，估計形狀 | JM 最大概似 |
+| spline_PH_lognormal_knots | lognormal 分位數選節點的樣條 PH | JMbayes 貝氏估計 |
+| spline_PH_loglogistic_knots | loglogistic 分位數選節點的樣條 PH | JMbayes 貝氏估計 |
 
-前兩項是 JM 的最大概似估計，後兩項是 JMbayes 的貝氏估計。
+後兩項的基線仍為樣條 PH；lognormal、loglogistic 決定節點來源，不是最終基線的參數分布限制。模型比較同時涉及基線結構與估計方法。
 
-## 01｜載入套件，定義基線風險
-定義的基線風險 $h_0(t)$。
+[完整程式 analysis.R](analysis.R) · [loglogistic 配適段落](#loglogistic) · [更換生成基線](#switch-baseline)
 
-$$h_0(t)=\frac{k}{a}\left(\frac{t}{a}\right)^{k-1},\qquad k=\texttt{shape},\ a=\texttt{scale}.$$
+本頁每個短段程式與前方說明一一對應。02a–02d、03a–03e、09b–09d、10a–10c 各自是**同一個函數的連續片段**，部分片段中的大括號尚未閉合；複製執行時須合併該函數所有片段，或直接執行完整程式檔。片段編號亦標在 analysis.R，方便搜尋定位。
 
-生成資料時固定 `shape=1`，所以 $h_0(t)=1/a$；`scale=100` 對應基線風險率 0.01。
+## 01｜套件與基線風險函數
 
-### 每個主要符號
+MASS 生成相關的隨機效果；nlme 配適縱向混合模型；survival 提供存活資料格式、Cox、參數存活模型與 KM；JM 與 JMbayes 配適聯合模型。本分析使用 JMbayes，並非 JMbayes2。
 
-- `haz0_weibull <- function(...)`
-- `t`：時間，可以一次傳入多個時間；`tt`：把太小的時間換成 `eps` 後的暫存結果。
-- `eps=1e-12`：$10^{-12}$。`pmax(t, eps)` 逐元素取較大值，不是把整組時間只留最大值。
+基線風險使用 Weibull 表達式：
 
-`MASS` 生成相關的隨機效果；`nlme` 配適指標的混合模型；`survival` 處理存活資料、Cox、參數存活模型與 KM；`JM`、`JMbayes` 配適聯合模型。
+$$h_0(t)=\frac{k}{a}\left(\frac{t}{a}\right)^{k-1},\qquad k=\texttt{shape},\quad a=\texttt{scale}.$$
+
+shape=1 時退化為 exp 基線，scale=100 對應基線 rate 0.01。這裡只計算風險率，沒有使用 exp 的事件時間解析解。原點直接採公式的極限，不以 eps 截斷時間：形狀大於 1 時為 0，小於 1 時為無限大，但正形狀下在原點附近可積分。
+
+haz0_weibull 是自訂函數名稱；haz0 表示基線風險。t 可同時包含多個時間，函數回傳相同長度的風險向量。符號 <- 將右側物件存成左側名稱；function 定義計算方式。
 
 ```r
 library(MASS)
@@ -33,76 +34,78 @@ library(survival)
 library(JM)
 library(JMbayes)
 
-haz0_weibull <- function(t, shape, scale, eps = 1e-12) {
-  tt <- pmax(t, eps)
-  (shape / scale) * (tt / scale)^(shape - 1)
+haz0_weibull <- function(t, shape, scale) {
+  if (length(shape) != 1L || !is.finite(shape) || shape <= 0 ||
+      length(scale) != 1L || !is.finite(scale) || scale <= 0 ||
+      any(!is.finite(t)) || any(t < 0)) {
+    stop("時間須非負且有限，shape、scale 須為有限正數。")
+  }
+  if (shape == 1) return(rep(1 / scale, length(t)))
+  (shape / scale) * (t / scale)^(shape - 1)
 }
 ```
 
-## 02｜cox_exp：由累積風險門檻找出事件時間
+## 02｜有限追蹤期間的事件生成
 
-個人的瞬間風險為 $h_i(u)=h_0(u)\exp\{\eta_i(u)\}$；累積風險為
+對病人 i，瞬間風險、累積風險與存活函數為
 
-$$A_i(t)=\int_0^t h_i(u)\,du,\qquad S_i(t)=\exp[-A_i(t)].$$
+$$h_i(u)=h_0(u)\exp\{\eta_i(u)\},\qquad
+A_i(t)=\int_0^t h_i(u)\,du,\qquad S_i(t)=\exp[-A_i(t)].$$
 
-先抽 $U\sim U(0,1)$ 再解 $A_i(T_i)=-\log U$ 可以生成事件時間。程式等價地只抽一次 `E <- rexp(1)`，亦即 $E\sim\mathrm{Exp}(1)$；`E` 是**累積風險門檻**。
+抽取一次 $E_i\sim\mathrm{Exp}(1)$，等價於 $-\log U_i$，其中 $U_i\sim U(0,1)$。在設限時間 $C_i$ 以前，若累積風險跨過 E，則求解 $A_i(T_i)=E_i$；若 $A_i(C_i)<E_i$，只記錄 $X_i=C_i,\delta_i=0$。
 
-`A` 儲存「輸入 t 就回傳累積風險」的函數，`f` 儲存 $f(t)=A(t)-E$。找 `f(t)=0` 就是在找門檻首次被累積風險碰到的時間。因為風險非負，累積風險不會隨時間下降；本版正風險下，有限解唯一。
+條件於病人的潛在軌跡與 C，此程序保留正確的右設限資料分布：設限機率為 $P(E_i>A_i(C_i))=\exp[-A_i(C_i)]$；期間內事件時間的分布仍由同一個累積風險反解。獨立設限的生成方式在第 03 段設定。
 
-### 先說明傳入值和內層函數
+### 02a｜函數介面與輸入
 
-| 名稱 | 作用 |
-|---|---|
-| `id` | 這次在替哪位病人生成時間 |
-| `eta_fun(u,id)` | 在時間 u 讀取那位病人的線性預測值 |
-| `haz0_fun(u)` | 基線風險函數 |
-| `t_upper_init` | 初次搜尋右端點 |
-| `t_upper_max` | 搜尋右端點最多到哪裡；不是事件時間的理論最大值 |
-| `tU` | 搜尋時目前的右端點，U 代表 upper |
-| `fu` | $f(tU)$，用來判斷門檻是否已被跨過 |
+cox_exp 保留既有名稱，計算本身不限制 exp。haz0_fun 是可替換的基線風險函數；未指定時使用 haz0_weibull。eta_fun(u,id) 提供病人 i 在時間 u 的線性預測值，不要求一定為直線。
 
-### 找不到，所以乘 2
-
-假設初始上限是 10。先算 $f(10)$：
-
-- 若 $f(10)\ge0$，門檻已在 0 到 10 之間被跨過，停止擴張。
-- 若 $f(10)<0$，累積風險還不夠；將 `tU` 改成 20，再算 $f(20)$。
-- 若仍小於 0，繼續試 40、80……，直到跨過門檻，或碰到 `t_upper_max`。
+censor_time 是該病人的有限設限時間；t_upper_init 是第一次嘗試的搜尋右端點。函數回傳一個包含 time、event、Ttrue 的清單，不再只回傳事件時間數值。Ttrue 僅對觀察到事件者填入；設限者為 NA，表示未求出其完整事件時間。
 
 ```r
-cox_exp <- function(id, shape, scale, eta_fun,
+cox_exp <- function(id, shape, scale, eta_fun, censor_time,
                     t_upper_init = 10,
-                    t_upper_max = 1e6,
-                    eps = 1e-12,
                     rel.tol = 1e-8,
                     subdivisions = 2000L,
-                    A_inf = NULL,
                     haz0_fun = NULL) {
   if (is.null(haz0_fun)) {
-    haz0_fun <- function(u) haz0_weibull(u, shape, scale, eps = eps)
+    haz0_fun <- function(u) haz0_weibull(u, shape, scale)
   }
   if (!is.function(haz0_fun) || !is.function(eta_fun)) {
     stop("haz0_fun 與 eta_fun 必須是函數。")
   }
   if (length(t_upper_init) != 1L || !is.finite(t_upper_init) || t_upper_init <= 0)
     stop("t_upper_init 必須是單一、有限且大於 0 的數值。")
-  if (length(t_upper_max) != 1L || !is.finite(t_upper_max) || t_upper_max < t_upper_init)
-    stop("t_upper_max 必須有限，且不得小於 t_upper_init。")
+  if (length(censor_time) != 1L || !is.finite(censor_time) || censor_time <= 0)
+    stop("censor_time 必須是單一、有限且大於 0 的設限時間。")
   if (length(rel.tol) != 1L || !is.finite(rel.tol) || rel.tol <= 0 ||
       length(subdivisions) != 1L || !is.finite(subdivisions) ||
       subdivisions < 1 || subdivisions != floor(subdivisions))
     stop("rel.tol 須為正數，subdivisions 須為正整數。")
-  if (!is.null(A_inf)) {
-    if (length(A_inf) != 1L || is.na(A_inf) || A_inf <= 0)
-      stop("A_inf 必須是正數或 Inf。")
-  }
+```
 
-  A <- function(t) {
+### 02b｜累積風險的數值積分
+
+A(t) 計算 0 到 t 的風險面積。內層先取得 h0 與 eta，再計算個人風險 h。haz0_fun、eta_fun 均須支援向量輸入並回傳相同長度；非法或超出數值範圍的結果會停止運算。
+
+integrate 自適應細分積分區間。subdivisions=2000L 是子區間數上限，不是固定切成 2,000 等份；L 表示整數。rel.tol、abs.tol 分別控制要求的相對與絕對精度，$value 取積分結果。這個分區間與量測時點、預測跨度無關。[R integrate 文件](https://stat.ethz.ch/R-manual/R-devel/library/stats/html/integrate.html)
+
+```r
+A <- function(t) {
     if (length(t) != 1L || !is.finite(t) || t < 0)
       stop("A(t) 的 t 必須是單一、有限且非負的數值。")
     if (t == 0) return(0)
     val <- integrate(
-      function(u) haz0_fun(u) * exp(eta_fun(u, id)),
+      function(u) {
+        h0 <- haz0_fun(u)
+        eta <- eta_fun(u, id)
+        if (length(h0) != length(u) || length(eta) != length(u) ||
+            any(!is.finite(h0)) || any(h0 < 0) || any(!is.finite(eta)))
+          stop("風險函數須對每個積分時間回傳合法值。")
+        h <- h0 * exp(eta)
+        if (any(!is.finite(h))) stop("個人風險超出數值範圍。")
+        h
+      },
       lower = 0, upper = t,
       rel.tol = rel.tol, abs.tol = rel.tol,
       subdivisions = subdivisions, stop.on.error = TRUE
@@ -111,71 +114,54 @@ cox_exp <- function(id, shape, scale, eta_fun,
       stop("病人 ", id, "：累積風險計算失敗。")
     val
   }
+```
 
-  E <- rexp(1)
+### 02c｜累積風險門檻與搜尋上限
+
+E 在每位病人的呼叫中只抽一次。f(t)=A(t)-E；fu 儲存目前右端點 tU 的 f 值。fu 小於 0 表示截至 tU 尚未跨過門檻。
+
+搜尋先從 min(t_upper_init,C) 開始。尚未跨過門檻且未達 C 時，上限加倍，最大到 C。例：初始上限 10、C=35，候選上限為 10、20、35；若 C=0.8，第一次就檢查 0.8。加倍是快速擴張範圍的數值策略，不是事件時間的統計規律。
+
+這段沿用上一個 tU 來計算新上限，但每次 A(tU) 都重新積分 0 到 tU，沒有快取前一段面積。若實作增量積分，必須使用 $A(20)=A(10)+\int_{10}^{20}h_i(u)du$，不能只拿後段面積和整個 E 比較。
+
+到達 C 且仍未跨門檻時，回傳設限結果。C 是實際追蹤終點，因此此處有根據記為設限；這與任意搜尋到一個大數仍無根，就宣稱事件永不發生不同。
+
+```r
+E <- rexp(1)
   if (!is.finite(E) || E <= 0) stop("抽到無效的累積風險門檻。")
-  if (!is.null(A_inf) && E >= A_inf) return(Inf)
   f <- function(t) A(t) - E
-  tU <- t_upper_init
+  tU <- min(t_upper_init, censor_time)
   fu <- f(tU)
   while (fu < 0) {
-    if (tU >= t_upper_max) {
-      stop("病人 ", id, "：搜尋上限內仍未找到事件時間；",
-           "請檢查搜尋範圍、積分結果與累積風險上限。")
+    if (tU >= censor_time) {
+      return(list(time = censor_time, event = 0L, Ttrue = NA_real_))
     }
-    tU <- min(tU * 2, t_upper_max)
+    tU <- min(tU * 2, censor_time)
     fu <- f(tU)
   }
-  ans <- uniroot(f, interval = c(0, tU), tol = 1e-8, check.conv = TRUE)$root
-  if (!is.finite(ans) || ans <= 0)
+```
+
+### 02d｜求根與事件結果
+
+搜尋完成後，f(0)=-E<0，f(tU)≥0，因此在區間內求解零點。uniroot 回傳的 root 為事件時間；tol 是求根精度，與前面的積分精度用途不同。check.conv=TRUE 要求求根失敗時停止。
+
+回傳 time=事件時間、event=1、Ttrue=事件時間。若正風險下存在有限解，解唯一；一般非負且局部可積分風險下，累積風險仍為非遞減。數值積分與求根的精度仍須依模型及參數確認。
+
+```r
+ans <- uniroot(f, interval = c(0, tU), tol = 1e-8, check.conv = TRUE)$root
+  if (!is.finite(ans) || ans <= 0 || ans > censor_time)
     stop("病人 ", id, "：有限事件時間計算失敗。")
-  ans
+  list(time = ans, event = 1L, Ttrue = ans)
 }
 ```
 
-## 03｜simulate_cox_exp：每位病人的指標、事件與右設限
+## 03｜縱向資料與右設限存活資料
 
-### 先生成個體差異，再把個體差異帶進風險
+### 03a｜模擬參數與容器函數
 
-`n=5000` 是病人人數。`Z` 不隨時間改變共變數；預設 `rbinom(n,1,0.5)` 。`MASS::mvrnorm` 依 `D` 生成相關的隨機截距 `b0`、隨機斜率 `b1`。
+simulate_cox_exp 組織整批資料的生成。n 是病人人數；visit_grid 是預定量測時點；beta_fix 是指標的固定截距與斜率；D 是隨機截距、隨機斜率的共變異矩陣；sigma_y 是量測誤差標準差。gamma、alpha 分別是 Z 與潛在指標對風險的係數。
 
-`D` 的兩個變異數都是 0.5，標準差為 $\sqrt{0.5}\approx0.7071$；共變異數 0.01 對應相關係數 0.02。
-
-$$m_i(t)=(2+b_{0i})+(-0.5+b_{1i})t,\quad y_i(t)=m_i(t)+\epsilon_i(t),\quad\epsilon_i(t)\sim N(0,0.1^2).$$
-
-`m_it` 儲存真實軌跡函數，`eta_fun` 儲存 $\eta_i(t)=\gamma Z_i+\alpha m_i(t)$。其中 `beta_fix` 是指標的固定截距／斜率，`alpha=2.5` 是指標對風險的關聯強度，`gamma=1` 是 Z 對風險的係數。
-
-### 為什麼這裡要另外算 A_inf
-
-本版固定 `shape=1` 且指標為直線。因此令
-
-$$\eta_{0i}=\gamma Z_i+\alpha(\beta_0+b_{0i}),\quad s_i=\alpha(\beta_1+b_{1i}),\quad q_i=\exp(\eta_{0i})/\texttt{scale},$$
-
-就有 $h_i(t)=q_i e^{s_i t}$。`eta0`、`slope` 分別存前兩項，且
-
-$$A_i(\infty)=\begin{cases}q_i/(-s_i),&s_i<0,\\ \infty,&s_i\ge0.\end{cases}$$
-
-程式用 `log_A_inf=eta0-log(scale)-log(-slope)` 再取指數，減少中間運算的數值範圍問題；若仍超出可表示範圍便中止。此公式只用來正確判斷是否有有限事件時間，有限時間仍交給前段積分＋求根。這解決先前負斜率病人可能永遠碰不到門檻的情況。
-
-`T_true <- rep(NA_real_,n)` 先準備 n 個待填位置；`for(i in seq_len(n))` 逐人填入。`NA_real_` 是數值型的缺值，`Inf` 則是模型下無有限事件時間，兩者不一樣。有限 $A_\infty$ 時，$P(T_i=\infty\mid b_i,Z_i)=e^{-A_\infty}$，因此有些 `Inf` 可以是這個模型的合理結果。
-
-**不要在此版只把 shape 改成 2。** 此上限公式依賴 exp 基線，所以本版會檢查 `shape==1`；這是固定 exp 情境版，換生成基線請讀原本的 [通式版切換說明](../BASELINE_SWITCH.md)。
-
-### 右設限怎麼建立
-
-`Cind` 是獨立抽出的隨機設限時間，`cens_rate=1.6` 是它的 rate；其平均為 $1/1.6=0.625$，不是平均 1.6，也不是最後設限比例。`admin_tau=30` 是行政截止時間。
-
-$$C_i=\min(C_{ind,i},30),\quad X_i=\min(T_i,C_i),\quad\delta_i=I(T_i\le C_i).$$
-
-`pmin` 是逐人取較小值，所以 `time` 是 X、`event` 是 δ。`event=0` 時只知道病人在 X 之前沒事件，並不知道真正事件何時發生，這就是右設限。它與預測起點是否等於 0 無關。
-
-### 為什麼還要一個量測迴圈
-
-每人的 `time` 不同，能保留的量測筆數也不同。`visit_grid` 是 0、0.2……2 共 11 個預定量測時點；`keep_rule` 決定保留 `< time[i]` 或 `<= time[i]`。最後量測時間 2 並不是行政設限時間 30。
-
-`t_i` 是第 i 人仍可觀察的時點，`mu` 是這些時點的真實指標值，`y_i` 加上量測誤差。`long_list[[i]]` 儲存一人的資料表，`do.call(rbind,long_list)` 再按列合併。`next` 表示此人沒有可保留的量測時，跳到下一人。
-
-回傳的是清單：`long` 多人多列、`surv` 每人一列、`censoring_rate` 為實際設限比例、`settings` 為設定。`surv$Ttrue` 和 `surv$C` 是模擬時的額外資訊，後續配適與 IPCW 不拿真實事件時間作弊。
+預設 shape=1、scale=100 對應 exp 基線，haz0_fun 可傳入其他基線。函數名稱沿用 exp，但沒有以 shape=1 限制數值演算法。match.arg 從允許的選項中確定 Z_dist 與 keep_rule。
 
 ```r
 simulate_cox_exp <- function(
@@ -187,11 +173,11 @@ simulate_cox_exp <- function(
     gamma = 1.0, alpha = 2.5,
     shape = 1.0, scale = 100.0,
     admin_tau = 30, cens_rate = 1.6,
-    keep_rule = c("<", "<=")) {
+    keep_rule = c("<", "<="), haz0_fun = NULL) {
   Z_dist <- match.arg(Z_dist)
   keep_rule <- match.arg(keep_rule)
   stopifnot(length(n) == 1L, is.finite(n), n >= 2, n == floor(n),
-            length(shape) == 1L, is.finite(shape), shape == 1,
+            length(shape) == 1L, is.finite(shape), shape > 0,
             length(scale) == 1L, is.finite(scale), scale > 0,
             length(beta_fix) == 2L, all(is.finite(beta_fix)),
             is.matrix(D), all(dim(D) == c(2, 2)), all(is.finite(D)),
@@ -203,38 +189,60 @@ simulate_cox_exp <- function(
             length(cens_rate) == 1L, is.finite(cens_rate), cens_rate > 0,
             length(visit_grid) > 0L, all(is.finite(visit_grid)),
             visit_grid[1] == 0, all(diff(visit_grid) > 0))
+```
 
-  Z <- if (Z_dist == "binom") rbinom(n, 1, 0.5) else rnorm(n)
+### 03b｜共變數、隨機效果與指標軌跡
+
+Z 預設為成功機率 0.5 的二元共變數。b 的每列是一位病人，b0、b1 分別為隨機截距與斜率。D 對角線 0.5 是變異數，標準差為 $\sqrt{0.5}$；共變異數 0.01 對應相關係數 0.02。
+
+$$m_i(t)=(\beta_0+b_{0i})+(\beta_1+b_{1i})t,\qquad
+\eta_i(t)=\gamma Z_i+\alpha m_i(t).$$
+
+m_it 計算潛在指標軌跡；eta_fun 將其連到存活風險。指標量測誤差尚未加入，因此事件風險使用潛在指標，而非含誤差的量測值。
+
+```r
+Z <- if (Z_dist == "binom") rbinom(n, 1, 0.5) else rnorm(n)
   b <- MASS::mvrnorm(n, mu = c(0, 0), Sigma = D)
   colnames(b) <- c("b0", "b1")
   m_it <- function(t, i) {
     (beta_fix[1] + b[i, "b0"]) + (beta_fix[2] + b[i, "b1"]) * t
   }
   eta_fun <- function(t, id) gamma * Z[id] + alpha * m_it(t, id)
+```
 
+### 03c｜設限時間與觀察到的事件結果
+
+先獨立抽取 $C_{ind,i}\sim\mathrm{Exp}(\texttt{cens_rate})$，再令 $C_i=\min(C_{ind,i},\texttt{admin_tau})$。cens_rate=1.6 是 rate，其平均設限時間為 1/1.6，並非最終設限比例。
+
+每位病人呼叫 cox_exp，依 C[i] 取得觀察時間與事件指標。obs_i 是單人的回傳清單；符號 $ 讀取其中的欄位。time、event 與 T_true 預先配置 n 個位置，再逐人填入。NA_real_ 表示數值型未知值，不表示無限大。
+
+T_true 對設限者保留 NA；本分析的目標是右設限觀察資料，未生成其設限之後的完整事件時間。因此這一欄不能用於需要所有人潛在事件時間的 oracle 評分。
+
+```r
+Cind <- rexp(n, rate = cens_rate)
+  C <- pmin(Cind, admin_tau)
+  time <- rep(NA_real_, n)
+  event <- rep(NA_integer_, n)
   T_true <- rep(NA_real_, n)
   for (i in seq_len(n)) {
-    eta0 <- eta_fun(0, i)
-    slope <- alpha * (beta_fix[2] + b[i, "b1"])
-    if (!is.finite(eta0) || !is.finite(slope)) stop("風險參數不合法。")
-    A_inf <- Inf
-    if (slope < 0) {
-      log_A_inf <- eta0 - log(scale) - log(-slope)
-      A_inf <- exp(log_A_inf)
-      if (!is.finite(A_inf) || A_inf <= 0)
-        stop("病人 ", i, "：有限累積風險上限超出可表示的數值範圍。")
-    }
-    T_true[i] <- cox_exp(
+    obs_i <- cox_exp(
       id = i, shape = shape, scale = scale, eta_fun = eta_fun,
-      t_upper_init = admin_tau, A_inf = A_inf
+      censor_time = C[i], t_upper_init = 10, haz0_fun = haz0_fun
     )
+    time[i] <- obs_i$time
+    event[i] <- obs_i$event
+    T_true[i] <- obs_i$Ttrue
   }
+```
 
-  Cind <- rexp(n, rate = cens_rate)
-  C <- pmin(Cind, admin_tau)
-  time <- pmin(T_true, C)
-  event <- as.integer(is.finite(T_true) & T_true <= C)
-  long_list <- vector("list", n)
+### 03d｜保留追蹤期間的量測
+
+visit_grid 為 0、0.2、…、2，共 11 個預定量測時點。keep_rule 決定是否保留結束追蹤當下的量測。t_i 是第 i 人保留下來的時間，mu 是對應的潛在指標，y_i 加入獨立常態誤差。
+
+long_list 逐人存放量測表；每人觀察時間不同，因此列數可以不同。next 表示沒有量測可保留時跳到下一人。最後量測時間 2 與行政追蹤截止時間 30 是不同設定。
+
+```r
+long_list <- vector("list", n)
   for (i in seq_len(n)) {
     if (keep_rule == "<") {
       t_i <- visit_grid[visit_grid < time[i]]
@@ -246,7 +254,16 @@ simulate_cox_exp <- function(
     y_i <- mu + rnorm(length(t_i), 0, sigma_y)
     long_list[[i]] <- data.frame(id = i, time = t_i, y = y_i, Z = Z[i])
   }
-  long_df <- if (any(!vapply(long_list, is.null, logical(1)))) {
+```
+
+### 03e｜合併與回傳
+
+do.call(rbind,long_list) 按列合併各人的量測。long_df 為一人多列，surv_df 為一人一列。long 的 time 是量測時間，surv 的 time 是事件或設限時間。
+
+censoring_rate 由實際 event=0 的比例計算。settings 保存生成參數與自訂基線函數，供結果追溯。後續模型與 IPCW 使用 time、event、Z 和量測歷史，不使用 Ttrue 或 C 作為預測特徵。
+
+```r
+long_df <- if (any(!vapply(long_list, is.null, logical(1)))) {
     do.call(rbind, long_list)
   } else {
     data.frame(id = integer(0), time = numeric(0), y = numeric(0), Z = numeric(0))
@@ -257,17 +274,16 @@ simulate_cox_exp <- function(
        settings = list(n = n, visit_grid = visit_grid, beta_fix = beta_fix,
                        D = D, sigma_y = sigma_y, Z_dist = Z_dist,
                        gamma = gamma, alpha = alpha, shape = shape, scale = scale,
-                       admin_tau = admin_tau, cens_rate = cens_rate, keep_rule = keep_rule))
+                       admin_tau = admin_tau, cens_rate = cens_rate, keep_rule = keep_rule,
+                       haz0_fun = haz0_fun))
 }
 ```
 
-## 04｜真正生成一次資料，固定這份資料作比較
+## 04｜生成一份固定的 exp 情境資料
 
-前三段以定義函數為主，現在才呼叫 `simulate_cox_exp` 真正抽資料。`set.seed(2025)` 固定亂數起點，方便在相同程式與環境下重現；若改變抽亂數順序或演算法，不保證與先前對話的資料完全相同。
+本段執行資料生成；前面的函數定義本身不會產生樣本。set.seed 固定亂數起點；sim 儲存回傳清單，long、surv 取出兩張表。head 只顯示前幾列；N=5000 對應 nrow(surv)，不是量測表總列數。
 
-`sim` 是清單，`sim$long`、`sim$surv` 取出其中兩張表。`head` 只顯示前幾列，不代表只生成這幾人。`nrow(surv)` 應對應設定的 N=5000；`nrow(long)` 是量測總筆數，通常不同。
-
-下面這段只跑一次。後續四個模型都使用同一個 `long` 和 `surv`，不在模型之間重新 `simulate_cox_exp`。若要比較你原本工作階段那份資料，應以保存的資料替代這個生成區塊，不能把本次新資料的分數與舊資料分數直接當成同資料比較。
+四個模型使用這同一份資料。更換抽亂數順序後，即使種子相同，也不應期待與舊版生成完全相同的逐人資料。本版先抽 C 再抽事件門檻，因此與舊版數值結果需分開記錄。
 
 ```r
 set.seed(2025)
@@ -280,25 +296,11 @@ print(data.frame(n_subjects = nrow(surv), n_measurements = nrow(long),
                  censoring_rate = sim$censoring_rate))
 ```
 
-## 05｜先建立指標模型與 Cox 初始物件
+## 05｜初始縱向模型與存活模型
 
-### 先對齊 id，為什麼不能省略
+### 05a｜病人對齊
 
-兩張表列數不同，但病人必須一致。`levels_id` 存同一套編號順序，`factor` 明確指定類別層級；`order` 排好病人與時間。`match(long$id,surv$id)` 回傳每筆量測對應到存活表的哪一列，存入 `ix`，用來檢查 Z 與追蹤時間一致。這不是把重複量測刪掉，而是避免模型把不同人的資料配在一起。
-
-### lmefit 是哪一個模型
-
-`y ~ time + Z` 表示固定效果包含截距、時間、Z；截距預設存在。`random=~time|id` 表示每人有隨機截距與隨機時間斜率。`|id` 是按病人分組，不是做「或」運算。`lmefit` 是這個初始縱向模型的估計結果。
-
-生成端未讓 Z 直接影響指標，因此縱向 Z 係數真值為 0；仍沿用原作者模型包含 Z 的形式。`na.action=na.fail` 避免默默刪除缺值列。`opt="optim"` 指定初始混合模型的最佳化器，與事件生成時的 `uniroot` 完全不同。
-
-### coxfit_weibull 這個名字容易誤解
-
-`coxph(Surv(time,event)~Z)` 在這裡提供聯合模型所需的存活子模型結構與初始估計，並沒有指定 Weibull 基線。左側的名稱雖保留 `coxfit_weibull`，真正指定 Weibull 的地方在下一段 `jointModel`。
-
-`cluster=id` 保留病人群聚設定；它影響 Cox 的穩健變異數處理，不代表後續聯合模型自動沿用同一套穩健標準誤。`x=TRUE`、`model=TRUE` 保留設計矩陣及模型資料，讓後續函數讀取。
-
-`coxfit_exp <- coxfit_weibull` 是讓兩個聯合模型使用同一個初始 Cox 物件，不表示 exp 與 Weibull 最終配適也一樣。聯合模型會重新共同估計參數，報告要看最後的 joint 模型摘要，不只是 `lmefit` 摘要。
+levels_id 建立共同病人順序，factor 指定相同層級，再依病人與量測時間排序。ix=match(long$id,surv$id) 將每筆量測對到該人的存活資料，檢查共變數與追蹤時間一致。
 
 ```r
 stopifnot(!anyNA(long$id), !anyNA(surv$id), !anyDuplicated(surv$id),
@@ -312,7 +314,17 @@ long <- long[order(long$id, long$time), ]
 surv <- surv[order(surv$id), ]
 ix <- match(long$id, surv$id)
 stopifnot(all(long$Z == surv$Z[ix]), all(long$time <= surv$time[ix]))
+```
 
+### 05b｜子模型結構
+
+lmefit 配適固定效果 y~time+Z，以及每人的隨機截距、隨機斜率。公式中的 |id 表示按病人分組；生成端未包含 Z 對指標的直接作用，因此縱向 Z 係數的真值為 0。
+
+coxfit_weibull 僅是 Cox 初始物件的名稱。coxph 在這一步沒有指定 Weibull 基線；後續 jointModel 才指定基線形式。x=TRUE、model=TRUE 保留模型所需資訊；cluster=id 的 Cox 穩健變異數設定不表示最終聯合模型自動使用同樣的穩健標準誤。
+
+coxfit_exp 使用相同初始物件，兩個最終 joint 模型仍會分別估計。
+
+```r
 lmefit <- nlme::lme(
   y ~ time + Z, random = ~ time | id, data = long,
   na.action = na.fail, control = nlme::lmeControl(opt = "optim")
@@ -326,15 +338,11 @@ stopifnot(identical(unique(as.character(lmefit$groups[[1]])),
                     as.character(coxfit_weibull$model[["(cluster)"]])))
 ```
 
-## 06｜配適 exp 和 Weibull：只差是否固定形狀
+## 06｜exp 與 Weibull 聯合模型
 
-兩個呼叫都用同一份資料的 `lmefit`、Cox 初始物件，且都使用 `parameterization="value"`：風險與當下的潛在指標值 $m_i(t)$ 關聯。`timeVar="time"` 告訴套件哪一欄是縱向時間。
+parameterization="value" 表示風險連結當下潛在指標值。weibull-PH-aGH 指定 Weibull PH 及自適應高斯–埃米特積分，用於對未觀察隨機效果的概似積分；與第 02 段對時間的積分不同。
 
-`method="weibull-PH-aGH"` 指定 Weibull PH 聯合模型與自適應高斯–埃米特數值積分。配適時需把每人未觀察的隨機效果積分掉；aGH 用於近似這個概似積分。它不是第二段為生成 T 而計算的時間積分，積分變數與用途都不同。
-
-exp 那一個加上 `scaleWB=1`；在此 PH 實作，固定相關 Weibull 參數為 1 就得到常數基線。它不是生成端的 `scale=100`，也不是把 `lmefit` 的殘差標準差固定為 1。Weibull 那一個不固定，交給資料估計形狀。`jm_control` 讓兩邊使用相同控制設定。[JM jointModel 文件](https://search.r-project.org/CRAN/refmans/JM/html/jointModel.html)
-
-`jointfit_exp`、`jointfit_weibull` 分開儲存，避免後面把同一個模型重複拿去算兩欄。檢查收斂與固定參數屬於執行時基本檢查，不等於模型已充分驗證。若形狀估計接近 1，兩個模型分數可以非常接近；單次樣本也不保證 exp 每一列都較低。
+exp 配適透過 scaleWB=1 固定相關 Weibull 參數為 1，使基線為常數；這是配適模型的限制，不是資料生成演算法的解析特例，也不是生成尺度 scale=100。Weibull 配適則讓形狀由資料估計。jointfit_exp 與 jointfit_weibull 分別保存兩個結果。[JM jointModel 文件](https://search.r-project.org/CRAN/refmans/JM/html/jointModel.html)
 
 ```r
 jm_control <- list()
@@ -358,21 +366,13 @@ print(summary(jointfit_exp))
 print(summary(jointfit_weibull))
 ```
 
-## 07｜原作者 lognormal 分支：選節點，再配樣條 PH
+## 07｜lognormal 節點的樣條 PH
 
-這段有兩個不同層次，不要把第一個分布名稱誤認為最後模型的基線限制。
+### 07a｜估計分位數與節點
 
-先由 `survreg(...~1,dist="lognormal")` 對觀察存活資料配一個只有截距的參數存活模型。`ln0` 儲存結果；`mu_hat_ln` 是 log 時間的位置估計，`sd_hat_ln` 是 log 時間的尺度估計。這個初步模型沒有加入 Z 或縱向指標，其目的在於挑時間節點，不是最終的聯合模型。
+ln0 是只有截距的 lognormal 存活模型，用於挑選節點。mu_hat_ln、sd_hat_ln 是 log 時間的位置與尺度。probs 是四個分位機率 0.1、約 0.3667、約 0.6333、0.9；qlnorm 換算成時間分位數。
 
-`probs=seq(0.1,0.9,length.out=4)` 是四個分位機率，約為 0.1、0.3667、0.6333、0.9；不是 0.1 到 0.9 每隔 0.1 一個。`qlnorm` 將它們換成時間分位數，放進 `knots_ln`。接著只保留觀察時間範圍內的有限節點，去重排序；保留數量可能少於四個。
-
-第二步才呼叫 `jointModelBayes`。`baseHaz="regression-splines"` 允許以樣條描述基線，`knots` 告訴它內部節點位置，`ordSpline=4` 是四階、也就是三次樣條。這種節點是樣條基底結構的接點，不是把病人的事件變成區間設限，也不是每段都固定同一風險值。[JMbayes 文件](https://search.r-project.org/CRAN/refmans/JMbayes/html/jointModelBayes.html)
-
-`ObsTimes.knots=FALSE` 沿用原作者設定：套件自動選節點時使用事件時間而非所有觀察時間；本段已明確傳入節點，不是靠這個旗標選出 lognormal 分位數。`param="td-value"` 對應當下指標值的關聯。
-
-`n.iter=12000` 是總迭代數，`n.burnin=2000` 捨棄前段，`n.thin=5` 對剩餘迭代抽稀。設定種子方便重現，但 MCMC 執行結束與印出摘要不等於已確認收斂。此版依要求不另外執行診斷測試。
-
-結果明確取名 `jm_spline_lnknots`：`jm` 是 joint model，`spline` 表示樣條，`lnknots` 表示 lognormal 選節點。原作者若叫它 `jm_lognormalPH`，名稱仍不會改變實際模型。
+knots_ln 僅保留觀察時間範圍內的有限節點，排序並去除重複值。此初步參數模型不含指標關聯，並非最終聯合模型。
 
 ```r
 ln0 <- survival::survreg(Surv(time, event) ~ 1, data = surv, dist = "lognormal")
@@ -383,59 +383,73 @@ knots_ln <- qlnorm(probs, meanlog = mu_hat_ln, sdlog = sd_hat_ln)
 knots_ln <- sort(unique(knots_ln[is.finite(knots_ln) &
                                   knots_ln > min(surv$time) & knots_ln < max(surv$time)]))
 if (!length(knots_ln)) stop("沒有可用的 lognormal 內部節點。")
+```
+
+### 07b｜配適樣條聯合模型
+
+baseHaz="regression-splines" 決定最終基線為樣條，knots 指定內部節點，ordSpline=4 表示三次樣條。ObsTimes.knots 是套件自動選節點時的設定；本段已明確傳入分位數節點。
+
+n.iter 為總迭代數，n.burnin 為前段捨棄次數，n.thin 為抽稀間距。seed 在 control 明確指定套件使用的亂數種子。摘要輸出不等於完成 MCMC 收斂診斷。[JMbayes 文件](https://search.r-project.org/CRAN/refmans/JMbayes/html/jointModelBayes.html)
+
+```r
 set.seed(2025)
 jm_spline_lnknots <- JMbayes::jointModelBayes(
   lmeObject = lmefit, survObject = coxfit_weibull,
   timeVar = "time", param = "td-value", baseHaz = "regression-splines",
   control = list(knots = knots_ln, ordSpline = 4, ObsTimes.knots = FALSE,
-                 n.iter = 12000, n.burnin = 2000, n.thin = 5)
+                 n.iter = 12000, n.burnin = 2000, n.thin = 5, seed = 2025)
 )
 print(summary(jm_spline_lnknots))
 ```
 
-## 08｜原作者 loglogistic 分支：改節點來源，保留樣條模型
+<a id="loglogistic"></a>
+## 08｜loglogistic 節點的樣條 PH
 
-沿用同一份資料。`ll0` 是只有截距的 loglogistic 存活模型；其 log 時間可表示為 location `mu_hat_ll` 加上 scale `sd_hat_ll` 乘標準 logistic 變數，因此時間分位數是
+### 08a｜loglogistic 分位數
+
+ll0 為只有截距的 loglogistic 存活模型。log 時間採 logistic 的位置–尺度表達式，時間分位數為
 
 $$Q_T(p)=\exp\{\hat\mu+\hat\sigma\,Q_{\mathrm{logistic}}(p)\}.$$
 
-這就是 `exp(mu_hat_ll+sd_hat_ll*qlogis(probs))`。這裡的 `sd_hat_ll` 沿用容易辨認的名稱，但嚴格地說它是 logistic 的 scale，不是 log 時間的標準差；標準 logistic 的變異數為 $\pi^2/3$。不要因名稱帶 sd 就當成標準差。
-
-得到 `knots_ll` 後，篩選節點，再配相同種類的樣條 PH，結果存 `jm_spline_llknots`。這裡沒有重新生成 loglogistic 資料，生成真相仍是 exp。它與上一段主要差在節點位置，不是兩種嚴格參數基線的比較。
+mu_hat_ll 是位置，sd_hat_ll 雖保留 sd 名稱，實際是 logistic scale，不是標準差。qlogis 提供標準 logistic 分位數，knots_ll 儲存轉換後的時間節點。此步驟使用既有 exp 情境資料，沒有重新生成 loglogistic 資料。
 
 ```r
 ll0 <- survival::survreg(Surv(time, event) ~ 1, data = surv, dist = "loglogistic")
+probs <- seq(0.1, 0.9, length.out = 4)
 mu_hat_ll <- as.numeric(coef(ll0))
 sd_hat_ll <- as.numeric(ll0$scale)
 knots_ll <- exp(mu_hat_ll + sd_hat_ll * qlogis(probs))
 knots_ll <- sort(unique(knots_ll[is.finite(knots_ll) &
                                   knots_ll > min(surv$time) & knots_ll < max(surv$time)]))
 if (!length(knots_ll)) stop("沒有可用的 loglogistic 內部節點。")
+```
+
+### 08b｜樣條模型配適
+
+此分支與 lognormal 分支使用相同種類的聯合模型，差別在節點位置。jm_spline_llknots 表示 loglogistic 選節點的樣條 PH，而非嚴格參數式 Loglogistic-PH。
+
+```r
 set.seed(2025)
 jm_spline_llknots <- JMbayes::jointModelBayes(
   lmeObject = lmefit, survObject = coxfit_weibull,
   timeVar = "time", param = "td-value", baseHaz = "regression-splines",
   control = list(knots = knots_ll, ordSpline = 4, ObsTimes.knots = FALSE,
-                 n.iter = 12000, n.burnin = 2000, n.thin = 5)
+                 n.iter = 12000, n.burnin = 2000, n.thin = 5, seed = 2025)
 )
 print(summary(jm_spline_llknots))
 ```
 
-## 09｜預測：只讀起點以前的資料，逐人取得條件存活機率
+## 09｜動態條件存活預測
 
-設定起點 $s=\texttt{Tstart}$、終點 $t=\texttt{Thoriz}$，要估計的是
+預測目標為
 
-$$\hat p_i(s,t)=\widehat P\{T_i>t\mid T_i>s,\mathcal Y_i(s),Z_i\}.$$
+$$\hat p_i(s,t)=\widehat P(T_i>t\mid T_i>s,\mathcal Y_i(s),Z_i),\qquad t=s+\Delta.$$
 
-意思是「已知此人在 s 時仍無事件，並知道截至 s 的指標歷史，他能存活超過 t 的機率」。例如 s=0.5、t=0.7，使用量測時點 0、0.2、0.4，不能偷讀 0.6 的量測；即使最後一次量測在 0.4，`last.time` 仍是已知存活的起點 0.5。
+s=Tstart 為起點，t=Thoriz 為終點，$\mathcal Y_i(s)$ 為起點以前的指標歷史。模型使用同一份配適結果，隨起點更新個人的條件資訊。
 
-`ids` 是這次可評分的病人編號，下一段才選出。`di` 是起點以前的量測子表；`S_hat` 準備存每人機率，並以 id 命名。`inherits` 辨認模型來自哪個套件；JM 逐人呼叫，JMbayes 使用批次呼叫，因為兩者介面及回傳格式不同。
+### 09a｜依時間與欄名取預測機率
 
-`survfitJM(...simulate=FALSE)` 取得代入式預測，而非完整抽樣平均。JM 在估計參數下求個人隨機效果的經驗貝氏後驗眾數，再帶入預測；不能把它描述成 aGH 直接回傳個人隨機效果。JMbayes 有不同的參數估計來源，同樣選 FALSE 不代表兩套推論方式完全相同。
-
-`sf` 是套件回傳的預測物件，`sf$summaries` 是每人的摘要清單，`m` 是某人的時間／機率表。`extract_survprob` 按欄名 `times`、`predSurv` 與終點找結果；`row` 是符合終點的列號。`abs(... )<1e-8` 容忍浮點表示造成的極小時間差，不是容忍預測錯誤。
-
-檢查列數唯一、機率落在 0 到 1、id 能一一對應，是避免取錯列或配錯人，不是把不理想的預測改成漂亮的結果。預測失敗時停止，不刪人後繼續計分。
+m 是某人的預測摘要表，row 找出對應終點的列號。使用 times、predSurv 欄名，避免取錯欄位；時間比較允許極小的浮點誤差。機率須有限且介於 0 與 1。
 
 ```r
 # 按時間與欄名取機率，不猜「第一列第二欄」，也不刪除預測失敗者。
@@ -452,6 +466,13 @@ extract_survprob <- function(m, Thoriz, id) {
 
 # JM 用逐人呼叫；JMbayes 保留原作者的批次預測形式。
 # 本教材明確固定 simulate=FALSE：兩者都是 plug-in，但參數估計來源不同。
+```
+
+### 09b｜準備起點以前的資料
+
+ids 是本次評估的病人編號。di 只取 time≤Tstart 的量測，再依 id 與時間排序。S_hat 預先配置每人的機率並以 id 命名。即使最後量測早於起點，已知存活時間仍使用 Tstart。
+
+```r
 get_S_hat <- function(jointfit, long_df, ids, Tstart, Thoriz) {
   stopifnot(length(ids) > 0L, !anyNA(ids), !anyDuplicated(ids),
             Tstart > 0, Thoriz > Tstart)
@@ -460,7 +481,16 @@ get_S_hat <- function(jointfit, long_df, ids, Tstart, Thoriz) {
   if (!all(ids %in% di$id)) stop("部分病人沒有起點以前的量測。")
   stopifnot(all(is.finite(di$time)), all(is.finite(di$y)), all(is.finite(di$Z)))
   S_hat <- setNames(rep(NA_real_, length(ids)), as.character(ids))
-  if (inherits(jointfit, "JMbayes")) {
+```
+
+### 09c｜JMbayes 的批次預測
+
+inherits 判斷模型類別。JMbayes 分支一次傳入多位病人的量測歷史；sf 為預測物件，sm 為每人摘要清單。依病人名稱取出摘要，避免回傳順序不同而配錯人。
+
+simulate=FALSE 使用代入式預測，沒有完整抽樣平均所有參數不確定性。
+
+```r
+if (inherits(jointfit, "JMbayes")) {
     sf <- JMbayes::survfitJM(jointfit, newdata = di, idVar = "id",
                             last.time = Tstart, survTimes = Thoriz, simulate = FALSE)
     sm <- sf$summaries
@@ -471,7 +501,16 @@ get_S_hat <- function(jointfit, long_df, ids, Tstart, Thoriz) {
       i <- as.character(ids[k])
       S_hat[k] <- extract_survprob(sm[[i]], Thoriz, i)
     }
-  } else if (inherits(jointfit, "jointModel")) {
+```
+
+### 09d｜JM 的逐人預測與回傳
+
+JM 分支逐人呼叫 survfitJM。此設定在估計參數下使用個人隨機效果的經驗貝氏後驗眾數進行代入式預測；配適階段的 aGH 與此處個人效果的估計步驟不同。
+
+函數最後回傳 S_hat。預測失敗會停止，不刪除該人或填入固定機率。
+
+```r
+} else if (inherits(jointfit, "jointModel")) {
     for (k in seq_along(ids)) {
       i <- ids[k]
       sf <- JM::survfitJM(jointfit, newdata = di[di$id == i, , drop = FALSE],
@@ -486,41 +525,13 @@ get_S_hat <- function(jointfit, long_df, ids, Tstart, Thoriz) {
 }
 ```
 
-## 10｜一個起點的 IPCW Brier：三種情況與 KM 權重
+## 10｜單一起點的 IPCW Brier Score
 
-### 先確定誰在這次評估中
+### 10a｜風險集與機率對齊
 
-`ids <- surv_df$id[surv_df$time>Tstart]` 只選起點還被追蹤的人，再確認此人有起點以前的量測。`R` 是這次的存活資料子表，`n_risk` 是人數 $n_s$，`n_no_history` 記錄缺少指標歷史而未納入的人。若它不為 0，評估族群限於有歷史者，不能當作所有起點存活者。
+只納入 $X_i>s$ 且起點以前有量測資料的人，形成 $\mathcal R_s$。R 是其存活資料表，n_risk 是人數 $n_s$。n_no_history 記錄因缺少歷史而未納入的人；若非零，評估族群限於具備歷史資料者。
 
-每人的理想誤差為 $[I(T_i>t)-\hat p_i]^2$，但有些人在 t 以前設限，我們不知道 $I(T_i>t)$，所以用 inverse probability of censoring weighting，簡稱 IPCW。
-
-### 三種情況如何填進公式
-
-令 $X_i=\min(T_i,C_i)$，$\delta_i=I(T_i\le C_i)$。在本版獨立設限下，定義條件設限存活函數 $G_s(u)=P(C_i>u\mid C_i>s)$。對起點風險集中的人：
-
-| 程式名稱 | 情況 | 真正結局 | 權重 | 評分貢獻 |
-|---|---|---:|---:|---:|
-| `dead` | $s<X_i\le t,\delta_i=1$ | 0 | $1/\hat G_s(X_i-)$ | $\hat p_i^2/\hat G_s(X_i-)$ |
-| `alive` | $X_i>t$ | 1 | $1/\hat G_s(t)$ | $(1-\hat p_i)^2/\hat G_s(t)$ |
-| `unknown` | $s<X_i\le t,\delta_i=0$ | 未知 | 0 | 0 |
-
-因此
-
-$$\widehat{BS}(s,t)=\frac1{n_s}\sum_{i\in\mathcal R_s}\left[\frac{I(X_i\le t,\delta_i=1)\hat p_i(s,t)^2}{\hat G_s(X_i-)}+\frac{I(X_i>t)(1-\hat p_i(s,t))^2}{\hat G_s(t)}\right].$$
-
-`contrib` 先全部設 0，再替前兩種人填入加權平方誤差。未知者留在分母，不能刪掉再平均；這裡分母是 `n_risk`，也不是權重總和。權重大於 1 是因為仍能觀察到的人代表了部分被設限的人。
-
-### KM 到底估計什麼
-
-`Surv(time,1-event)` 將設限當作 KM 事件、真正事件當作 KM 的設限，因此是反向 KM，估計設限時間的存活機率，不是疾病的存活機率。`km` 保存估計曲線；`G_step` 是依曲線查值的函數，對應數學中的 $\hat G_s$。
-
-輸入 `R` 已限制為 $X_i>s$，所有人都活著並被追蹤到 s；在目前設限獨立的設定下，這條 KM 從條件機率 1 開始估計。因此不再額外乘一次 G(s)。如果改用全樣本 KM 估計無條件 G，才要改用 $G(u)/G(s)$ 的條件化邏輯，不可把兩種寫法混用。
-
-`left=TRUE` 使用 `km$time<x`，取事件時間前一瞬間的 $G_s(X_i-)$；一般查終點則用 `<=`。`tail(...,1)` 取最近一個已發生的 KM 跳點，因此 KM 在兩個跳點間保持上一個值。這裡的「沿用上一段」是階梯函數查值，與前面的累積風險積分面積、搜尋上限倍增都不相同。
-
-如果所需 G 太小，權重會很大。`min_G=0.05` 是本程式的停止門檻，不是公式中的固定常數，也不是把 G 裁切成 0.05。若評分停止，需檢查追蹤支持與時間範圍，不能默默刪除失敗者或給固定機率。
-
-本模擬獨立抽 Cind，符合使用共同 KM 的設計。若未來設限依賴病人特徵、指標或事件過程，需要相應條件設限模型與可識別假設，不能保證同一條 KM 仍適用。暫不另輸出每人的權重明細，但計分本身已使用權重。
+S_hat 依 R 的 id 順序重新對齊。預測時不使用起點以後的指標，觀察結局則用於後續評分。
 
 ```r
 # 一個起點、一個終點的評分：條件反向 KM + 三種 IPCW 貢獻。
@@ -541,7 +552,24 @@ brier_ipcw <- function(jointfit, long_df, surv_df, Tstart, Thoriz, min_G = 0.05)
   S_hat <- unname(S_hat[as.character(R$id)])
   stopifnot(length(S_hat) == nrow(R), all(is.finite(S_hat)),
             all(S_hat >= 0 & S_hat <= 1))
-  dead <- R$event == 1 & R$time <= Thoriz
+```
+
+### 10b｜三種結局與反向 KM
+
+令 $X_i=\min(T_i,C_i)$、$\delta_i=I(T_i\le C_i)$。在起點風險集中，定義 $G_s(u)=P(C_i>u\mid C_i>s)$。
+
+| 條件 | 程式名稱 | 已知結局 $I(T_i>t)$ | IPCW 權重 |
+|---|---|---:|---:|
+| $s<X_i\le t,\delta_i=1$ | dead | 0 | $1/\hat G_s(X_i-)$ |
+| $X_i>t$ | alive | 1 | $1/\hat G_s(t)$ |
+| $s<X_i\le t,\delta_i=0$ | unknown | 未知 | 0 |
+
+Surv(time,1-event) 以設限作為 KM 的事件、真正事件作為 KM 的設限，估計設限存活機率。輸入已是起點後仍被追蹤者，因此在本分析的獨立設限設定下，直接估計條件 G_s，不再額外乘 G(s)。
+
+G_step 依 KM 跳點查值：left=TRUE 使用嚴格小於，得到事件前一瞬間的左極限；一般查終點用小於等於。在相鄰跳點之間保持上一個 KM 值，這與累積風險的積分面積無關。
+
+```r
+dead <- R$event == 1 & R$time <= Thoriz
   alive <- R$time > Thoriz
   unknown <- !dead & !alive
   km <- survival::survfit(survival::Surv(time, 1 - event) ~ 1, data = R)
@@ -551,7 +579,22 @@ brier_ipcw <- function(jointfit, long_df, surv_df, Tstart, Thoriz, min_G = 0.05)
       if (length(idx)) tail(km$surv[idx], 1) else 1
     }, numeric(1))
   }
-  G_ti <- G_step(R$time[dead], left = TRUE)
+```
+
+### 10c｜加權平方誤差
+
+$$\widehat{BS}(s,t)=\frac1{n_s}\sum_{i\in\mathcal R_s}
+\left[
+\frac{I(X_i\le t,\delta_i=1)\hat p_i(s,t)^2}{\hat G_s(X_i-)}
++\frac{I(X_i>t)\{1-\hat p_i(s,t)\}^2}{\hat G_s(t)}
+\right].$$
+
+contrib 儲存每人的貢獻，unknown 留為 0，但仍留在分母 n_risk。分母不是已知結局的人數，也不是權重總和。min_G=0.05 是本實作的支持度停止門檻，不是將較小的 G 裁切到 0.05。
+
+共同 KM 依賴設限獨立與權重分母為正等條件；若設限依賴病人特徵或指標歷史，需相應的條件設限模型。此分析先不另輸出逐人權重表，但計分過程仍使用上述權重。
+
+```r
+G_ti <- G_step(R$time[dead], left = TRUE)
   G_t <- G_step(Thoriz)
   denom <- c(G_ti, if (any(alive)) G_t else numeric(0))
   if (length(denom) && any(!is.finite(denom) | denom < min_G))
@@ -567,13 +610,11 @@ brier_ipcw <- function(jointfit, long_df, surv_df, Tstart, Thoriz, min_G = 0.05)
 }
 ```
 
-## 11｜把起點往後移：相同跨度、重新選人與讀歷史
+## 11｜移動起點、固定跨度
 
-`brier_ipcw` 做一個起點；`brier_grid` 用迴圈把所有起點做完。`Tstarts` 是起點向量，`Dt` 是固定跨度，`j` 是第幾個起點；每次令 `s=Tstarts[j]`、`t=s+Dt`。`out[[j]]` 存那次的一列表格，最後 `rbind` 合成多列表格。
+brier_grid 對每個 Tstarts 執行同一個評分步驟。j 為起點索引，s 是當次起點，t=s+Dt 是終點；out[[j]] 保存一列結果，最後以 rbind 合併。
 
-例如第一次評估 0.0001 到 0.2001，下一次評估 0.2001 到 0.4001。下一次會重新選擇仍被追蹤的人，重新取得截至新起點的指標資料，重新算條件預測與 KM 權重。不是把前一次 S_hat 當成下一次答案，也不是把前一次 Brier 累加上去。
-
-同一個 joint 模型物件一路使用，不在每個起點重新配適。因為預測的條件資訊更新，所以這仍是動態預測。`tryCatch` 在錯誤前補上起點與終點資訊，然後停止；沒有用 `NA` 跳過失敗的時間。這樣才能知道哪裡出了問題。
+每個起點重新選人、讀取歷史、計算條件預測與 KM 權重。不重新配適 joint 模型，不沿用前次預測機率，也不累加前次 Brier。tryCatch 補上出錯起點與終點後停止，避免默默略過失敗的時間。
 
 ```r
 # 外層迴圈沿用原作者方向：移動 Tstart，固定 Dt；不重新配適模型。
@@ -595,17 +636,15 @@ brier_grid <- function(jointfit, long_df, surv_df, Tstarts, Dt, min_G = 0.05) {
 }
 ```
 
-## 12｜四個模型使用相同網格，輸出可以比較的表
+## 12｜四個模型的完整時間網格與輸出
 
-`fits` 是四個已配適模型的清單；`lapply` 對每個模型呼叫相同的 `brier_grid`。不是在這裡再次配適，也沒有重新生成資料。`tables` 是四張評分表；`tab_exp` 等名稱讓你能分別查看。`comparison` 再把四張表上下合併，加上 `model` 欄標明來源。
+fits 是四個模型清單，lapply 對每個模型套用相同時間網格與評分函數。tables 保存四張評分表，comparison 上下合併並加上 model 標籤。
 
-`Tstarts=seq(0.0001,2.4,by=0.2)` 產生 12 個起點，最後為 2.2001，對應最後終點 2.4001；2.4 不是一定會出現在序列中的值。0.0001 是沿用目前近零起點，並不完全等於 0。後期起點可超過最後量測時間 2，此時仍能預測，只是沒有新的指標量測可加入。
+起點由 0.0001 開始，每次增加 0.2，共 12 個，最後起點為 2.2001，終點為 2.4001。近零起點不完全等於 0。起點超過最後量測時間 2 後仍可預測，但沒有新指標量測可加入。
 
-一列是「某個模型，某個起點／終點，當時合格病人的平均誤差」。`n_event+n_alive+n_unknown=n_risk`；晚期人少，分數可能起伏。Brier 越小表示在同樣評估設定下誤差越小，但不要求隨時間單調下降，真實 exp 也不保證在單次模擬的每個起點都勝過 Weibull。
+每列代表一個模型在指定窗口的群體平均誤差，且 n_event+n_alive+n_unknown=n_risk。Brier 不要求隨起點單調下降；不同起點的評估族群不同，後期風險集較小。真實 exp 也不保證單次樣本的每個分數都低於 Weibull。
 
-輸出另存 `exp-only/results`，不覆寫原本的 `results`；`.gitignore` 排除生成的結果。`sessionInfo` 保存 R 與套件版本。存檔會覆寫此新資料夾中同名的前次結果；要保留多次模擬需另加編號或目錄。
-
-目前為同一份資料配適與評分的樣本內表現，尚非獨立驗證或重複模擬平均。這裡也沒有計算 IBS：沿起點積分 $BS(s,s+\Delta)$ 與固定起點、沿終點積分是不同設計，需先釐清論文定義。先前縱向斜率約 -0.59 的問題仍依你的要求保留待查，不因教材整理完成就視為已解決。
+結果另存 exp-only/results；同名輸出在重跑時會覆寫。此處是樣本內、單次模擬評分，尚未加入獨立評估、重複模擬或 IBS。
 
 ```r
 Tstarts <- seq(0.0001, 2.4, by = 0.2)
@@ -635,22 +674,86 @@ saveRDS(list(settings = sim$settings, fits = fits, tables = tables),
 capture.output(sessionInfo(), file = file.path(output_dir, "sessionInfo.txt"))
 ```
 
-## 報告時可以用這段串起流程
+<a id="switch-baseline"></a>
+## 13｜生成基線的替換介面
 
-「本次固定以 exponential 基線生成一批 5,000 位病人的資料，讓個人的事件風險另外依賴 Z 與隨時間變化的潛在指標。以累積風險反解事件時間，再加入獨立右設限與量測誤差。同一份觀察資料分別配適 exp、Weibull，以及兩種選節點方式的樣條 PH 聯合模型。評估時移動預測起點、固定未來跨度 0.2，僅使用起點以前的指標歷史，最後用反向 KM 估計設限權重，計算動態 IPCW Brier score。目前是樣本內、單次模擬的比較。」
+本版的數值核心只需要非負、在有限追蹤區間局部可積分的基線風險，以及可在積分節點求值的 eta_fun。更換基線時保留有限追蹤、積分、求根與右設限邏輯；不需推導每個分布的無限時間累積風險上限。數值穩定性仍須依新模型檢查。傳入 haz0_fun 後，基線參數由該函數決定；simulate_cox_exp 的 shape、scale 不會自動改變自訂函數的參數。
 
-### 四種「區間／時間」不要混在一起
+以下是替代第 04 段的生成設定，並非在四個配適模型之間執行。生成新資料後須重新建立 long、surv 及所有配適與評分物件。函數保留 simulate_cox_exp 的歷史名稱，但可接受其他基線。
 
-| 場景 | 區間／時間代表什麼 | 是否沿用前段 |
-|---|---|---|
-| `tU` 搜尋 | 找到含事件時間解的搜尋範圍 | 用上一個上限乘 2；未快取積分面積 |
-| `integrate` | 對時間風險積分的內部自適應子區間 | 由數值積分器內部處理 |
-| `knots_ln/ll` | 樣條基底的節點位置 | 不是觀察到的事件區間，也不是搜尋步長 |
-| `G_step` | KM 跳點之間的階梯函數區間 | 查值時保持最近一個跳點的值 |
-| `Tstart,Thoriz` | 動態預測與評分的時間窗口 | 重新選人、更新歷史；不累加前次分數 |
+### Weibull 基線
 
-上述全程仍是右設限資料。預測有時間窗口，不等於資料變成區間設限。
+未提供 haz0_fun 時使用 haz0_weibull。shape=1.5、scale=100 為示範設定，不代表論文設定。形狀與尺度改變後，後面的配適模型仍可保留同樣四種，比較另一個生成情境。
 
-### 資料來源與版本範圍
+```r
+sim <- simulate_cox_exp(n = 5000, shape = 1.5, scale = 100)
+long <- sim$long
+surv <- sim$surv
+```
 
-程式以你貼出的 `haz0_weibull`／`cox_exp` 與原 `cox_exp.R` 分支為出發點；套件介面核對來源已附在對應段落。另可參閱 [JM survfitJM](https://search.r-project.org/CRAN/refmans/JM/html/survfitJM.html)、[JMbayes 預測原始碼](https://rdrr.io/cran/JMbayes/src/R/survfitJM.JMbayes.R)、[survival coxph](https://stat.ethz.ch/R-manual/R-devel/library/survival/html/coxph.html)。本次僅撰寫與核對教材內容，不宣稱已跑過模型、數值測試或 MCMC 收斂診斷。
+### Lognormal 基線
+
+基線風險為密度除以存活函數。以 log 密度減 log 存活機率計算，減少尾端直接相除的數值問題；u=0 時設定其風險極限 0。meanlog=2.5、sdlog=1 是 log 時間參數。其他參數在此仍沿用本版預設；若重現不同論文情境，須一併核對 alpha、設限 rate 等設定。
+
+```r
+haz0_lognormal <- function(u, meanlog = 2.5, sdlog = 1) {
+  stopifnot(all(is.finite(u)), all(u >= 0),
+            length(meanlog) == 1L, is.finite(meanlog),
+            length(sdlog) == 1L, is.finite(sdlog), sdlog > 0)
+  out <- numeric(length(u))
+  positive <- u > 0
+  out[positive] <- exp(
+    dlnorm(u[positive], meanlog, sdlog, log = TRUE) -
+      plnorm(u[positive], meanlog, sdlog, lower.tail = FALSE, log.p = TRUE)
+  )
+  out
+}
+sim <- simulate_cox_exp(n = 5000, haz0_fun = haz0_lognormal)
+long <- sim$long
+surv <- sim$surv
+```
+
+### Loglogistic 基線
+
+基線風險為 $(k/a)(u/a)^{k-1}/[1+(u/a)^k]$。正時間使用 log 尺度計算；原點依形狀指定極限。shape=2、scale=10 為示範設定。
+
+```r
+haz0_loglogistic <- function(u, shape = 2, scale = 10) {
+  stopifnot(all(is.finite(u)), all(u >= 0),
+            length(shape) == 1L, is.finite(shape), shape > 0,
+            length(scale) == 1L, is.finite(scale), scale > 0)
+  out <- numeric(length(u))
+  positive <- u > 0
+  z <- shape * (log(u[positive]) - log(scale))
+  log_denom <- pmax(z, 0) + log1p(exp(-abs(z)))
+  out[positive] <- exp(log(shape) - log(scale) +
+    (shape - 1) * (log(u[positive]) - log(scale)) - log_denom)
+  out[!positive] <- if (shape < 1) Inf else if (shape == 1) 1 / scale else 0
+  out
+}
+sim <- simulate_cox_exp(n = 5000, haz0_fun = haz0_loglogistic)
+long <- sim$long
+surv <- sim$surv
+```
+
+上述示例只改變生成端；樣條 PH 的 lognormal／loglogistic 標籤仍是選節點方式。改變 m_it 時亦須核對縱向配適結構；有限期間積分不再依賴直線斜率公式，但配適模型不會自動跟著更改。
+
+## 執行與範圍
+
+從 repository 根目錄執行以下程式。獨立環境保存物件，避免覆蓋既有同名資料；套件載入與種子仍作用於同一個 R 工作階段。完整程式一次執行全部模型與時間網格。
+
+```r
+exp_demo <- new.env(parent = globalenv())
+source("exp-only/analysis.R", local = exp_demo, encoding = "UTF-8")
+exp_demo$comparison
+```
+
+本版未執行模型、數值測試或 MCMC 收斂診斷。有限期間方法生成的是右設限觀察資料，不提供設限者完整的潛在事件時間；需要完整 T 的後續研究須另設計生成程序。
+
+## 方法與程式文件
+
+- [R integrate](https://stat.ethz.ch/R-manual/R-devel/library/stats/html/integrate.html)：自適應積分、誤差與區間設定。
+- [R uniroot](https://stat.ethz.ch/R-manual/R-devel/library/stats/html/uniroot.html)：求根區間與收斂設定。
+- [JM jointModel](https://search.r-project.org/CRAN/refmans/JM/html/jointModel.html)：聯合模型方法與控制參數。
+- [JM survfitJM](https://search.r-project.org/CRAN/refmans/JM/html/survfitJM.html)：條件存活預測。
+- [JMbayes jointModelBayes](https://search.r-project.org/CRAN/refmans/JMbayes/html/jointModelBayes.html)：樣條基線、節點與 MCMC 設定。
