@@ -11,21 +11,15 @@
 
 後兩項的基線仍為樣條 PH；lognormal、loglogistic 決定節點來源，不是最終基線的參數分布限制。模型比較同時涉及基線結構與估計方法。
 
-[完整程式 analysis.R](analysis.R) · [loglogistic 配適段落](#loglogistic) · [更換生成基線](#switch-baseline)
-
-本頁每個短段程式與前方說明一一對應。02a–02d、03a–03e、09b–09d、10a–10c 各自是**同一個函數的連續片段**，部分片段中的大括號尚未閉合；複製執行時須合併該函數所有片段，或直接執行完整程式檔。片段編號亦標在 analysis.R，方便搜尋定位。
-
 ## 01｜套件與基線風險函數
 
-MASS 生成相關的隨機效果；nlme 配適縱向混合模型；survival 提供存活資料格式、Cox、參數存活模型與 KM；JM 與 JMbayes 配適聯合模型。本分析使用 JMbayes，並非 JMbayes2。
+MASS 生成相關的隨機效果；nlme 配適縱向混合模型；survival 提供存活資料格式、Cox、參數存活模型與 KM；JM 與 JMbayes 配適聯合模型。
 
 基線風險使用 Weibull 表達式：
 
-$$h_0(t)=\frac{k}{a}\left(\frac{t}{a}\right)^{k-1},\qquad k=\texttt{shape},\quad a=\texttt{scale}.$$
+$$h_0(t)=\frac{\texttt{shape}}{\texttt{scale}}\left(\frac{t}{\texttt{scale}}\right)^{\texttt{shape}-1}.$$
 
-shape=1 時退化為 exp 基線，scale=100 對應基線 rate 0.01。這裡只計算風險率，沒有使用 exp 的事件時間解析解。原點直接採公式的極限，不以 eps 截斷時間：形狀大於 1 時為 0，小於 1 時為無限大，但正形狀下在原點附近可積分。
-
-haz0_weibull 是自訂函數名稱；haz0 表示基線風險。t 可同時包含多個時間，函數回傳相同長度的風險向量。符號 <- 將右側物件存成左側名稱；function 定義計算方式。
+shape=1 時退化為 exp 基線，scale=100 對應基線 rate 0.01。
 
 ```r
 library(MASS)
@@ -34,14 +28,9 @@ library(survival)
 library(JM)
 library(JMbayes)
 
-haz0_weibull <- function(t, shape, scale) {
-  if (length(shape) != 1L || !is.finite(shape) || shape <= 0 ||
-      length(scale) != 1L || !is.finite(scale) || scale <= 0 ||
-      any(!is.finite(t)) || any(t < 0)) {
-    stop("時間須非負且有限，shape、scale 須為有限正數。")
-  }
-  if (shape == 1) return(rep(1 / scale, length(t)))
-  (shape / scale) * (t / scale)^(shape - 1)
+haz0_weibull <- function(t, shape, scale, eps = 1e-12) {
+  tt <- pmax(t, eps)
+  (shape / scale) * (tt / scale)^(shape - 1)
 }
 ```
 
@@ -54,19 +43,18 @@ A_i(t)=\int_0^t h_i(u)\,du,\qquad S_i(t)=\exp[-A_i(t)].$$
 
 抽取一次 $E_i\sim\mathrm{Exp}(1)$，等價於 $-\log U_i$，其中 $U_i\sim U(0,1)$。在設限時間 $C_i$ 以前，若累積風險跨過 E，則求解 $A_i(T_i)=E_i$；若 $A_i(C_i)<E_i$，只記錄 $X_i=C_i,\delta_i=0$。
 
-條件於病人的潛在軌跡與 C，此程序保留正確的右設限資料分布：設限機率為 $P(E_i>A_i(C_i))=\exp[-A_i(C_i)]$；期間內事件時間的分布仍由同一個累積風險反解。獨立設限的生成方式在第 03 段設定。
-
 ### 02a｜函數介面與輸入
-
-cox_exp 保留既有名稱，計算本身不限制 exp。haz0_fun 是可替換的基線風險函數；未指定時使用 haz0_weibull。eta_fun(u,id) 提供病人 i 在時間 u 的線性預測值，不要求一定為直線。
 
 censor_time 是該病人的有限設限時間；t_upper_init 是第一次嘗試的搜尋右端點。函數回傳一個包含 time、event、Ttrue 的清單，不再只回傳事件時間數值。Ttrue 僅對觀察到事件者填入；設限者為 NA，表示未求出其完整事件時間。
 
 ```r
-cox_exp <- function(id, shape, scale, eta_fun, censor_time,
+cox_exp <- function(id, shape, scale, eta_fun,
                     t_upper_init = 10,
+                    t_upper_max = 1e6,
+                    eps = 1e-12,
                     rel.tol = 1e-8,
                     subdivisions = 2000L,
+                    A_inf = NULL,
                     haz0_fun = NULL) {
   if (is.null(haz0_fun)) {
     haz0_fun <- function(u) haz0_weibull(u, shape, scale)
@@ -86,9 +74,7 @@ cox_exp <- function(id, shape, scale, eta_fun, censor_time,
 
 ### 02b｜累積風險的數值積分
 
-A(t) 計算 0 到 t 的風險面積。內層先取得 h0 與 eta，再計算個人風險 h。haz0_fun、eta_fun 均須支援向量輸入並回傳相同長度；非法或超出數值範圍的結果會停止運算。
-
-integrate 自適應細分積分區間。subdivisions=2000L 是子區間數上限，不是固定切成 2,000 等份；L 表示整數。rel.tol、abs.tol 分別控制要求的相對與絕對精度，$value 取積分結果。這個分區間與量測時點、預測跨度無關。[R integrate 文件](https://stat.ethz.ch/R-manual/R-devel/library/stats/html/integrate.html)
+A(t) 計算 0 到 t 的風險面積。
 
 ```r
 A <- function(t) {
@@ -120,11 +106,9 @@ A <- function(t) {
 
 E 在每位病人的呼叫中只抽一次。f(t)=A(t)-E；fu 儲存目前右端點 tU 的 f 值。fu 小於 0 表示截至 tU 尚未跨過門檻。
 
-搜尋先從 min(t_upper_init,C) 開始。尚未跨過門檻且未達 C 時，上限加倍，最大到 C。例：初始上限 10、C=35，候選上限為 10、20、35；若 C=0.8，第一次就檢查 0.8。加倍是快速擴張範圍的數值策略，不是事件時間的統計規律。
+搜尋先從 min(t_upper_init,C) 開始。尚未跨過門檻且未達 C 時，上限加倍，最大到 C。例：初始上限 10、C=35，候選上限為 10、20、35；若 C=0.8，第一次就檢查 0.8。加倍是快速擴張範圍的數值策略。
 
-這段沿用上一個 tU 來計算新上限，但每次 A(tU) 都重新積分 0 到 tU，沒有快取前一段面積。若實作增量積分，必須使用 $A(20)=A(10)+\int_{10}^{20}h_i(u)du$，不能只拿後段面積和整個 E 比較。
-
-到達 C 且仍未跨門檻時，回傳設限結果。C 是實際追蹤終點，因此此處有根據記為設限；這與任意搜尋到一個大數仍無根，就宣稱事件永不發生不同。
+這段沿用上一個 tU 來計算新上限，但每次 A(tU) 都重新積分 0 到 tU，沒有快取前一段面積。
 
 ```r
 E <- rexp(1)
@@ -143,10 +127,6 @@ E <- rexp(1)
 
 ### 02d｜求根與事件結果
 
-搜尋完成後，f(0)=-E<0，f(tU)≥0，因此在區間內求解零點。uniroot 回傳的 root 為事件時間；tol 是求根精度，與前面的積分精度用途不同。check.conv=TRUE 要求求根失敗時停止。
-
-回傳 time=事件時間、event=1、Ttrue=事件時間。若正風險下存在有限解，解唯一；一般非負且局部可積分風險下，累積風險仍為非遞減。數值積分與求根的精度仍須依模型及參數確認。
-
 ```r
 ans <- uniroot(f, interval = c(0, tU), tol = 1e-8, check.conv = TRUE)$root
   if (!is.finite(ans) || ans <= 0 || ans > censor_time)
@@ -161,7 +141,7 @@ ans <- uniroot(f, interval = c(0, tU), tol = 1e-8, check.conv = TRUE)$root
 
 simulate_cox_exp 組織整批資料的生成。n 是病人人數；visit_grid 是預定量測時點；beta_fix 是指標的固定截距與斜率；D 是隨機截距、隨機斜率的共變異矩陣；sigma_y 是量測誤差標準差。gamma、alpha 分別是 Z 與潛在指標對風險的係數。
 
-預設 shape=1、scale=100 對應 exp 基線，haz0_fun 可傳入其他基線。函數名稱沿用 exp，但沒有以 shape=1 限制數值演算法。match.arg 從允許的選項中確定 Z_dist 與 keep_rule。
+預設 shape=1、scale=100 對應 exp 基線。
 
 ```r
 simulate_cox_exp <- function(
@@ -176,19 +156,16 @@ simulate_cox_exp <- function(
     keep_rule = c("<", "<="), haz0_fun = NULL) {
   Z_dist <- match.arg(Z_dist)
   keep_rule <- match.arg(keep_rule)
-  stopifnot(length(n) == 1L, is.finite(n), n >= 2, n == floor(n),
-            length(shape) == 1L, is.finite(shape), shape > 0,
-            length(scale) == 1L, is.finite(scale), scale > 0,
-            length(beta_fix) == 2L, all(is.finite(beta_fix)),
-            is.matrix(D), all(dim(D) == c(2, 2)), all(is.finite(D)),
-            isSymmetric(D), min(eigen(D, symmetric = TRUE)$values) > 0,
-            length(sigma_y) == 1L, is.finite(sigma_y), sigma_y > 0,
-            length(alpha) == 1L, is.finite(alpha),
-            length(gamma) == 1L, is.finite(gamma),
-            length(admin_tau) == 1L, is.finite(admin_tau), admin_tau > 0,
-            length(cens_rate) == 1L, is.finite(cens_rate), cens_rate > 0,
-            length(visit_grid) > 0L, all(is.finite(visit_grid)),
-            visit_grid[1] == 0, all(diff(visit_grid) > 0))
+  if (length(shape) != 1L ||
+      !is.finite(shape) ||
+      shape != 1) {
+    stop("目前 A_inf 的計算公式只適用於 shape = 1。")
+  }
+  if (length(scale) != 1L ||
+      !is.finite(scale) ||
+      scale <= 0) {
+    stop("scale 必須是有限且大於 0 的數值。")
+  }
 ```
 
 ### 03b｜共變數、隨機效果與指標軌跡
@@ -198,7 +175,7 @@ Z 預設為成功機率 0.5 的二元共變數。b 的每列是一位病人，b0
 $$m_i(t)=(\beta_0+b_{0i})+(\beta_1+b_{1i})t,\qquad
 \eta_i(t)=\gamma Z_i+\alpha m_i(t).$$
 
-m_it 計算潛在指標軌跡；eta_fun 將其連到存活風險。指標量測誤差尚未加入，因此事件風險使用潛在指標，而非含誤差的量測值。
+m_it 計算潛在指標軌跡；eta_fun 將其連到存活風險。
 
 ```r
 Z <- if (Z_dist == "binom") rbinom(n, 1, 0.5) else rnorm(n)
@@ -210,29 +187,67 @@ Z <- if (Z_dist == "binom") rbinom(n, 1, 0.5) else rnorm(n)
   eta_fun <- function(t, id) gamma * Z[id] + alpha * m_it(t, id)
 ```
 
-### 03c｜設限時間與觀察到的事件結果
+### 03c｜真實事件時間與右設限資料
 
-先獨立抽取 $C_{ind,i}\sim\mathrm{Exp}(\texttt{cens_rate})$，再令 $C_i=\min(C_{ind,i},\texttt{admin_tau})$。cens_rate=1.6 是 rate，其平均設限時間為 1/1.6，並非最終設限比例。
-
-每位病人呼叫 cox_exp，依 C[i] 取得觀察時間與事件指標。obs_i 是單人的回傳清單；符號 $ 讀取其中的欄位。time、event 與 T_true 預先配置 n 個位置，再逐人填入。NA_real_ 表示數值型未知值，不表示無限大。
-
-T_true 對設限者保留 NA；本分析的目標是右設限觀察資料，未生成其設限之後的完整事件時間。因此這一欄不能用於需要所有人潛在事件時間的 oracle 評分。
+先根據個人的風險函數生成真實事件時間，再獨立生成設限時間。
+在 exp 基線及直線型指標軌跡下，個人風險可寫為：
+$$h_i(t)=\text{base}_i\exp(\text{slope}_i t).$$
+其中，base 是時間零的個人風險率，slope 是線性預測值隨時間變化的斜率。總累積風險為：
+$$A_i(\infty)=\begin{cases}\text{base}_i/(-\text{slope}_i), & \text{slope}_i<0,\\
+\infty, & \text{slope}_i\ge 0.
+\end{cases}$$
+將此上限傳入 cox_exp。若抽取的累積風險門檻不低於有限上限，真實事件時間記為 Inf；其餘情況使用數值積分與求根取得有限事件時間。
+最後生成設限時間，建立觀察時間與事件指標：
+C_i=\min(C_{ind,i},\texttt{admin_tau}),\qquad
+X_i=\min(T_i,C_i),\qquad
+\delta_i=I(T_i\le C_i).
 
 ```r
-Cind <- rexp(n, rate = cens_rate)
-  C <- pmin(Cind, admin_tau)
-  time <- rep(NA_real_, n)
-  event <- rep(NA_integer_, n)
+  # 此處的累積風險上限公式限於 exp 基線
+  if (length(shape) != 1L ||
+      !is.finite(shape) ||
+      shape != 1) {
+    stop("目前 A_inf 公式只適用於 shape = 1。")
+  }
+  if (!is.null(haz0_fun)) {
+    stop("目前 A_inf 公式不適用於自訂 haz0_fun。")
+  }
+  # 先生成每位病人的真實事件時間
   T_true <- rep(NA_real_, n)
   for (i in seq_len(n)) {
-    obs_i <- cox_exp(
-      id = i, shape = shape, scale = scale, eta_fun = eta_fun,
-      censor_time = C[i], t_upper_init = 10, haz0_fun = haz0_fun
+    base <- exp(eta_fun(0, i)) / scale
+    slope <- alpha * (beta_fix[2] + b[i, "b1"])
+    if (!is.finite(base) ||
+        base <= 0 ||
+        !is.finite(slope)) {
+      stop("病人 ", i, "：風險參數計算失敗。")
+    }
+    if (slope < 0) {
+      A_inf <- base / (-slope)
+      if (!is.finite(A_inf) || A_inf <= 0) {
+        stop("病人 ", i, "：累積風險上限超出數值範圍。")
+      }
+    } else {
+      A_inf <- Inf
+    }
+    T_true[i] <- cox_exp(
+      id = i,
+      shape = shape,
+      scale = scale,
+      eta_fun = eta_fun,
+      t_upper_init = admin_tau,
+      A_inf = A_inf
     )
-    time[i] <- obs_i$time
-    event[i] <- obs_i$event
-    T_true[i] <- obs_i$Ttrue
   }
+  # 再生成獨立設限時間
+  Cind <- rexp(n, rate = cens_rate)
+  C <- pmin(Cind, admin_tau)
+
+  # 建立觀察時間與事件指標
+  time <- pmin(T_true, C)
+  event <- as.integer(
+    is.finite(T_true) & (T_true <= C)
+  )
 ```
 
 ### 03d｜保留追蹤期間的量測
