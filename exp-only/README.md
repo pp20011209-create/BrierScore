@@ -669,9 +669,803 @@ tab_spline_llknots <- tables$spline_PH_loglogistic_knots
 comparison <- do.call(rbind, lapply(names(tables), function(name) {
   cbind(model = name, tables[[name]])
 }))
-rownames(comparison) <- NULL
-print(comparison, digits = 10, row.names = FALSE)
+```
 
+## 13｜半參數聯合模型的目的與 start–stop 資料
+
+### 13.1｜分析目的
+
+本節使用同一份 exp 基線生成資料，增加半參數 Cox 聯合模型作為比較。
+
+模型仍保留潛在指標與事件風險的關聯：
+
+$$
+h_i(t)=h_0(t)\exp\{\gamma Z_i+\alpha m_i(t)\}.
+$$
+
+與 exp、Weibull 配適的主要差別，在於半參數模型不指定基線風險必須符合某個參數分布。迴歸係數與指標關聯係數仍需估計，因此稱為「半參數」。
+
+本節使用 JSM 套件的 jmodelTM。設定 model=1，以當下潛在指標值連結事件風險；rho=0 選擇 Cox PH。
+
+分析流程為：
+
+1. 將量測與存活資料整理為 start–stop 格式。
+2. 建立縱向及 Cox 初始模型。
+3. 配適 JSM 半參數聯合模型。
+4. 使用起點以前的歷史資料進行動態預測。
+5. 計算固定預測跨度的 IPCW Brier score。
+
+### 13.2｜start–stop 的資料意義
+
+start–stop 將一位病人的追蹤期間分成多列。
+
+例如病人在 0、0.2、0.4 有量測，於 0.55 發生事件：
+
+| start | stop | y 的量測時間 | event |
+|---:|---:|---:|---:|
+| 0 | 0.2 | 0 | 0 |
+| 0.2 | 0.4 | 0.2 | 0 |
+| 0.4 | 0.55 | 0.4 | 1 |
+
+start 是區段起點，stop 是區段終點，event 表示是否在該段終點發生事件。若最後在 0.55 設限，最後一列的 event 也為 0。
+
+這仍是右設限資料。Surv(start, stop, event) 表示追蹤區段，不表示只知道事件發生在兩個端點之間。
+
+JSM 使用相同資料表配適縱向與存活子模型，因此需要這種資料排列。每列保存一筆量測，但最終潛在指標仍由混合模型的截距與斜率描述，不是把量測值當作整段不變的真實指標。
+
+### 13.3｜連結量測與存活資料
+
+long 為一人多列的量測表，surv 為一人一列的存活表。
+
+建立副本後，將每筆量測對應到該病人的追蹤終點。Stime 保存追蹤終點，status 保存病人層級的事件指標。
+
+此處沿用量測時間嚴格早於追蹤終點的設定。
+
+```r
+library(nlme)
+library(survival)
+library(JSM)
+
+long_jsm <- long[, c("id", "time", "y", "Z")]
+surv_jsm <- surv[, c("id", "time", "event", "Z")]
+
+long_jsm$id <- as.character(long_jsm$id)
+surv_jsm$id <- as.character(surv_jsm$id)
+
+stopifnot(
+  !anyNA(long_jsm$id),
+  !anyNA(surv_jsm$id),
+  !anyDuplicated(surv_jsm$id),
+  setequal(long_jsm$id, surv_jsm$id),
+  !anyDuplicated(long_jsm[c("id", "time")]),
+  all(is.finite(long_jsm$time)),
+  all(is.finite(long_jsm$y)),
+  all(is.finite(long_jsm$Z)),
+  all(is.finite(surv_jsm$time)),
+  all(is.finite(surv_jsm$Z)),
+  all(surv_jsm$time > 0),
+  all(surv_jsm$event %in% c(0, 1))
+)
+
+ix <- match(long_jsm$id, surv_jsm$id)
+
+stopifnot(all(long_jsm$Z == surv_jsm$Z[ix]))
+
+long_jsm$Stime <- surv_jsm$time[ix]
+long_jsm$status <- surv_jsm$event[ix]
+
+if (any(long_jsm$time < 0 |
+        long_jsm$time >= long_jsm$Stime)) {
+  stop("量測時間必須非負，且嚴格早於追蹤終點。")
+}
+```
+
+### 13.4｜逐人建立追蹤區段
+
+di 是單一病人的量測資料，n_i 是其量測筆數。
+
+每列的 start 為量測時間，stop 為下一次量測時間；最後一列延伸到 Stime。最後一段不新增量測，也不複製額外的 y。
+
+event_i 先全部設為 0，再將最後一列設為該病人的事件狀態。
+
+```r
+ids <- sort(unique(surv_jsm$id))
+interval_list <- vector("list", length(ids))
+
+for (k in seq_along(ids)) {
+
+  i <- ids[k]
+
+  di <- long_jsm[long_jsm$id == i, , drop = FALSE]
+  di <- di[order(di$time), , drop = FALSE]
+
+  if (di$time[1] != 0) {
+    stop("病人 ", i, "：第一筆量測須位於時間 0。")
+  }
+
+  n_i <- nrow(di)
+  # 建立 區間終點
+  stop_i <- c(di$time[-1], di$Stime[1])
+
+  event_i <- integer(n_i)
+  event_i[n_i] <- di$status[1]
+
+  interval_list[[k]] <- data.frame(
+    id = i,
+    start = di$time,
+    stop = stop_i,
+    y = di$y,
+    Z = di$Z,
+    Stime = di$Stime,
+    event = event_i
+  )
+}
+```
+
+### 13.5｜合併區段資料
+
+data_long 是 JSM 配適使用的資料表。id 設為具有固定順序的 factor，並依病人與區段起點排序。
+
+整理後，每筆原始量測仍對應一列，事件總筆數也應保持一致。
+
+```r
+data_long <- do.call(rbind, interval_list)
+rownames(data_long) <- NULL
+
+data_long$id <- factor(data_long$id, levels = ids)
+
+data_long <- data_long[
+  order(data_long$id, data_long$start),
+  ,
+  drop = FALSE
+]
+
+stopifnot(
+  all(data_long$start < data_long$stop),
+  nrow(data_long) == nrow(long_jsm),
+  sum(data_long$event) == sum(surv_jsm$event)
+)
+
+head(data_long, 10)
+```
+
+## 14｜配適 JSM 半參數聯合模型
+
+### 14.1｜建立初始子模型
+
+縱向初始模型包含固定截距、時間及 Z，以及個人的隨機截距與斜率。
+
+依 JSM 文件，輸入的 lme 使用 pdDiag 結構。
+
+Cox 初始模型使用 start–stop 格式。x=TRUE 保存設計矩陣，y=TRUE 保存實際使用的存活反應資料。
+
+```r
+lme_model <- nlme::lme(
+  fixed = y ~ start + Z,
+  random = list(id = nlme::pdDiag(~ start)),
+  data = data_long,
+  na.action = na.fail,
+  control = nlme::lmeControl(opt = "optim")
+)
+
+cox_model <- survival::coxph(
+  survival::Surv(start, stop, event) ~ Z,
+  data = data_long,
+  x = TRUE,
+  y = TRUE,
+  model = TRUE,
+  na.action = na.fail
+)
+```
+
+### 14.2｜聯合模型與積分節點
+
+jmodelTM 共同估計縱向與存活部分。
+
+nknot 控制每個隨機效果維度的高斯–埃米特積分節點數。
+
+此處使用較少節點以降低計算負擔，因此將結果命名為 jm_model_cox_k3。
+
+```r
+gc()
+
+jm_model_cox_k3 <- jmodelTM(
+  fitLME = lme_model,
+  fitCOX = cox_model,
+  data = data_long,
+  model = 1,
+  rho = 0,
+  timeVarY = "start",
+  control = list(
+    nknot = 3,
+    max.iter = 250,
+    tol.P = 1e-3,
+    tol.L = 1e-6
+  )
+)
+
+print(jm_model_cox_k3$convergence)
+
+if (!identical(jm_model_cox_k3$convergence, "success")) {
+  stop("JSM 未回報成功收斂，暫不進行預測。")
+}
+
+summary(jm_model_cox_k3)
+```
+
+## 15｜整理聯合模型的預測參數
+
+### 15.1｜參數與預測範圍
+
+後續預測使用最終 joint model 的估計，而非初始 lme_model 的估計。
+
+| 代稱 | 意義 |
+|---|---|
+| beta | 縱向固定截距、時間與 Z 係數 |
+| phi | Z 對事件風險的係數 |
+| alpha | 潛在指標對事件風險的關聯係數 |
+| sigma | 指標量測誤差標準差 |
+| D | 隨機截距與斜率的共變異矩陣 |
+| u | 基線累積風險跳躍的事件時間 |
+| dH0 | 各事件時間的基線累積風險增量 |
+
+本節預測程式限定目前的模型結構：
+
+- 縱向：y ~ start + Z。
+- 隨機效果：截距與 start 斜率。
+- 存活共變數：Z。
+- 關聯方式：model=1。
+- 存活模型：rho=0。
+
+JSM 的基線增量直接加總，不再乘上時間間距。
+
+### 15.2｜取出並檢查參數
+
+```r
+prepare_jsm_prediction <- function(jsm_fit) {
+
+  if (!identical(jsm_fit$convergence, "success")) {
+    stop("JSM 尚未成功收斂。")
+  }
+
+  if (length(jsm_fit$rho) != 1L || jsm_fit$rho != 0) {
+    stop("此程式只適用於 rho = 0。")
+  }
+
+  cc <- jsm_fit$coefficients
+  beta_names <- c("(Intercept)", "start", "Z")
+
+  if (!setequal(names(cc$beta), beta_names) ||
+      length(cc$phi) != 1L ||
+      !identical(names(cc$phi), "Z")) {
+    stop("模型固定效果結構與目前預測程式不一致。")
+  }
+
+  D <- cc[["Bsigma"]]
+  if (is.null(D)) D <- cc[["BSigma"]]
+
+  re_names <- c("(Intercept)", "start")
+
+  if (!is.matrix(D) ||
+      !all(dim(D) == c(2, 2)) ||
+      !all(re_names %in% rownames(D)) ||
+      !all(re_names %in% colnames(D))) {
+    stop("無法確認隨機截距與斜率的共變異矩陣。")
+  }
+
+  D <- D[re_names, re_names, drop = FALSE]
+
+  lamb <- as.data.frame(cc$lamb)
+
+  if (!all(c("time", "bashaz") %in% names(lamb))) {
+    stop("基線估計欄位與預期不同。")
+  }
+
+  lamb <- lamb[order(lamb$time), , drop = FALSE]
+
+  p <- list(
+    beta = cc$beta[beta_names],
+    phi = as.numeric(cc$phi),
+    alpha = as.numeric(cc$alpha),
+    sigma = as.numeric(cc$Ysigma),
+    D = D,
+    u = lamb$time,
+    dH0 = lamb$bashaz
+  )
+
+  stopifnot(
+    all(is.finite(p$beta)),
+    is.finite(p$phi),
+    length(p$alpha) == 1L,
+    is.finite(p$alpha),
+    length(p$sigma) == 1L,
+    is.finite(p$sigma),
+    p$sigma > 0,
+    all(is.finite(D)),
+    isSymmetric(D),
+    min(eigen(D, symmetric = TRUE)$values) > 0,
+    length(p$u) > 0L,
+    all(is.finite(p$u)),
+    all(p$u > 0),
+    all(diff(p$u) > 0),
+    all(is.finite(p$dH0)),
+    all(p$dH0 >= 0)
+  )
+
+  p$Dinv <- solve(D)
+  p
+}
+
+jsm_par <- prepare_jsm_prediction(jm_model_cox_k3)
+```
+
+## 16｜個人累積風險與動態預測
+
+### 16.1｜未來窗口的累積風險
+
+給定個人的隨機效果 b，潛在指標為：
+
+```math
+m_i(u)=
+\widehat{\beta}_0
++\widehat{\beta}_1 u
++\widehat{\beta}_Z Z_i
++b_{0i}
++b_{1i}u.
+```
+
+在起點 s 到終點 t 的累積風險增量為：
+
+```math
+H_i(s,t\mid b_i)=\sum_{s \lt u_j \le t}\Delta\widehat{H}_0(u_j)\exp\left(\widehat{\phi}Z_i+\widehat{\alpha}m_i(u_j)\right).
+```
+
+其中，u 的下標 j 表示基線累積風險的跳點；每個跳點的基線累積風險增量，乘上個人的風險倍率，再於指定窗口內加總。
+
+`jsm_cumhaz` 的 `b` 是兩個個人隨機效果，`z` 是該人的 Z，`p` 是前段整理的模型參數。`lower` 與 `upper` 分別是窗口起點與終點。
+
+```r
+jsm_cumhaz <- function(b, z, lower, upper, p) {
+
+  use <- p$u > lower &
+         p$u <= upper &
+         p$dH0 > 0
+
+  if (!any(use)) return(0)
+
+  u <- p$u[use]
+
+  m <- p$beta["(Intercept)"] +
+       p$beta["start"] * u +
+       p$beta["Z"] * z +
+       b[1] + b[2] * u
+
+  log_terms <- log(p$dH0[use]) +
+               p$phi * z +
+               p$alpha * m
+
+  a <- max(log_terms)
+
+  if (!is.finite(a)) {
+    stop("累積風險計算出現非有限值。")
+  }
+
+  log_total <- a + log(sum(exp(log_terms - a)))
+
+  if (log_total > log(.Machine$double.xmax)) {
+    return(Inf)
+  }
+
+  exp(log_total)
+}
+```
+### 16.2｜由起點以前的資料估計個人效果
+
+預測目標為：
+
+$$
+\hat p_i(s,t)=
+\widehat P(T_i>t\mid T_i>s,Y_i(\le s),Z_i).
+$$
+
+本節採用經驗貝氏後驗眾數代入式預測。個人效果依下列分布估計：
+
+$$
+p(b_i\mid Y_i(\le s),T_i>s)
+\propto
+p(Y_i(\le s)\mid b_i)\,p(b_i)\,S_i(s\mid b_i).
+$$
+
+因此不能直接使用配適物件中以完整個人資料估計的 est.bi。
+
+以下函數先截取起點以前的量測。Q 為隨機效果設計矩陣，b_long、V 是只考慮這些量測時的常態後驗中心與共變異矩陣。
+
+```r
+predict_S_jsm <- function(di, z, Tstart, Thoriz, p) {
+
+  di <- di[di$time <= Tstart, , drop = FALSE]
+  di <- di[order(di$time), , drop = FALSE]
+
+  if (nrow(di) == 0L) {
+    stop("起點以前沒有量測資料。")
+  }
+
+  stopifnot(
+    Thoriz > Tstart,
+    all(is.finite(di$time)),
+    all(is.finite(di$y)),
+    all(di$Z == z)
+  )
+
+  Q <- cbind(1, di$time)
+
+  fixed_mean <- p$beta["(Intercept)"] +
+                p$beta["start"] * di$time +
+                p$beta["Z"] * z
+
+  residual <- di$y - fixed_mean
+
+  V <- solve(
+    p$Dinv + crossprod(Q) / p$sigma^2
+  )
+
+  b_long <- as.vector(
+    V %*% crossprod(Q, residual) / p$sigma^2
+  )
+
+  L <- t(chol(V))
+```
+
+### 16.3｜加入存活到起點的資訊
+
+以標準化座標 a 表示個人效果：
+
+$$b=b_{\mathrm{long}}+La.$$
+
+objective 是負對數後驗密度中與 a 有關的部分。第一項來自量測後驗，第二項為存活到起點的累積風險。
+
+```r
+  objective <- function(a) {
+
+    b <- b_long + as.vector(L %*% a)
+
+    H_start <- jsm_cumhaz(
+      b = b,
+      z = z,
+      lower = 0,
+      upper = Tstart,
+      p = p
+    )
+
+    sum(a^2) / 2 + H_start
+  }
+
+  if (!is.finite(objective(c(0, 0)))) {
+    stop("個人效果的最佳化起始值無效。")
+  }
+
+  opt <- optim(
+    par = c(0, 0),
+    fn = objective,
+    method = "BFGS",
+    control = list(
+      maxit = 500,
+      reltol = 1e-10
+    )
+  )
+
+  if (opt$convergence != 0L ||
+      !is.finite(opt$value) ||
+      any(!is.finite(opt$par))) {
+    stop("個人隨機效果估計未收斂。")
+  }
+
+  b_hat <- b_long + as.vector(L %*% opt$par)
+```
+
+### 16.4｜取得條件存活機率
+
+將 b_hat 代入累積風險，得到：
+
+$$
+\hat S_i(t\mid s)=\exp\{-H_i(s,t\mid\hat b_i(s))\}.
+$$
+
+S_hat 是一位病人在該窗口的預測機率。
+
+```r
+  H_future <- jsm_cumhaz(
+    b = b_hat,
+    z = z,
+    lower = Tstart,
+    upper = Thoriz,
+    p = p
+  )
+
+  S_hat <- exp(-H_future)
+
+  if (!is.finite(S_hat) || S_hat < 0 || S_hat > 1) {
+    stop("預測機率不合法。")
+  }
+
+  S_hat
+}
+```
+
+## 17｜JSM 的 IPCW Brier Score
+
+### 17.1｜風險集與逐人預測
+
+起點仍被追蹤，且起點以前有量測的人。R 是當次評估資料，history 是依病人分組的量測清單。
+
+n_no_history 記錄缺少量測歷史而未納入的人。
+
+```r
+brier_jsm_ipcw <- function(
+    p, history, surv_df,
+    Tstart, Thoriz, min_G = 0.05) {
+
+  stopifnot(
+    length(Tstart) == 1L,
+    is.finite(Tstart),
+    Tstart > 0,
+    length(Thoriz) == 1L,
+    is.finite(Thoriz),
+    Thoriz > Tstart,
+    length(min_G) == 1L,
+    is.finite(min_G),
+    min_G > 0,
+    min_G <= 1
+  )
+
+  R <- surv_df[
+    surv_df$time > Tstart,
+    ,
+    drop = FALSE
+  ]
+
+  has_history <- vapply(
+    as.character(R$id),
+    function(i) {
+      di <- history[[i]]
+      !is.null(di) && any(di$time <= Tstart)
+    },
+    logical(1)
+  )
+
+  n_no_history <- sum(!has_history)
+  R <- R[has_history, , drop = FALSE]
+
+  if (nrow(R) < 2L) {
+    stop("起點符合條件的病人不足 2 人。")
+  }
+
+  S_hat <- vapply(seq_len(nrow(R)), function(k) {
+
+    i <- as.character(R$id[k])
+
+    tryCatch(
+      predict_S_jsm(
+        di = history[[i]],
+        z = R$Z[k],
+        Tstart = Tstart,
+        Thoriz = Thoriz,
+        p = p
+      ),
+      error = function(e) {
+        stop(
+          "病人 ", i, "：", conditionMessage(e),
+          call. = FALSE
+        )
+      }
+    )
+  }, numeric(1))
+```
+
+### 17.2｜三種情況與設限存活函數
+
+令 X 為觀察時間，δ 為事件指標，條件設限存活函數為：
+
+$$G_s(u)=P(C>u\mid C>s).$$
+
+| 情況 | 名稱 | 評分貢獻 |
+|---|---|---|
+| 窗口內發生事件 | dead | $\hat S_i^2/\hat G_s(X_i-)$ |
+| 追蹤超過終點 | alive | $(1-\hat S_i)^2/\hat G_s(t)$ |
+| 窗口內設限 | unknown | 0，仍保留在平均分母 |
+
+Surv(time,1-event) 將設限當作 KM 事件，用反向 KM 估計設限存活機率。
+
+本分析在當次風險集上估計條件 G_s，因此不再額外乘 G(s)。這依賴目前獨立設限的設定。
+
+G_step 的 left=TRUE 取得事件前一瞬間的左極限；查終點時則使用該時間的階梯函數值。
+
+```r
+  dead <- R$event == 1 & R$time <= Thoriz
+  alive <- R$time > Thoriz
+  unknown <- !dead & !alive
+
+  km <- survival::survfit(
+    survival::Surv(time, 1 - event) ~ 1,
+    data = R
+  )
+
+  G_step <- function(x, left = FALSE) {
+
+    vapply(x, function(u) {
+
+      index <- if (left) {
+        which(km$time < u)
+      } else {
+        which(km$time <= u)
+      }
+
+      if (length(index)) {
+        tail(km$surv[index], 1)
+      } else {
+        1
+      }
+    }, numeric(1))
+  }
+
+  G_event <- G_step(R$time[dead], left = TRUE)
+  G_end <- G_step(Thoriz)
+
+  denominators <- c(
+    G_event,
+    if (any(alive)) G_end else numeric(0)
+  )
+
+  if (any(!is.finite(denominators) |
+          denominators < min_G)) {
+    stop("設限存活機率過小，該窗口缺乏足夠評分支持。")
+  }
+```
+
+### 17.3｜平均加權平方誤差
+
+contribution 保存每人的加權誤差。未知結局者貢獻為 0，但仍包含在 n_risk 中。
+
+min_G 是程式的支持度停止門檻。
+
+```r
+  contribution <- numeric(nrow(R))
+
+  contribution[dead] <- S_hat[dead]^2 / G_event
+
+  if (any(alive)) {
+    contribution[alive] <-
+      (1 - S_hat[alive])^2 / G_end
+  }
+
+  data.frame(
+    Tstart = Tstart,
+    Thoriz = Thoriz,
+    Dt = Thoriz - Tstart,
+    Brier = mean(contribution),
+    n_risk = nrow(R),
+    n_event = sum(dead),
+    n_alive = sum(alive),
+    n_unknown = sum(unknown),
+    n_no_history = n_no_history
+  )
+}
+```
+
+## 18｜執行完整時間網格與模型比較
+
+### 18.1｜整理預測使用的量測歷史
+
+history_jsm 將量測依病人分組，方便逐人讀取。雖然清單中保存完整量測，predict_S_jsm 每次仍只使用 Tstart 以前的資料。
+
+```r
+stopifnot(
+  !anyNA(surv$id),
+  !anyDuplicated(surv$id),
+  !anyNA(long$id),
+  !anyDuplicated(long[c("id", "time")]),
+  all(is.finite(surv$time)),
+  all(surv$time > 0),
+  all(surv$event %in% c(0, 1)),
+  all(is.finite(surv$Z)),
+  all(is.finite(long$time)),
+  all(long$time >= 0),
+  all(is.finite(long$y)),
+  all(is.finite(long$Z))
+)
+
+history_jsm <- split(
+  long,
+  as.character(long$id),
+  drop = TRUE
+)
+
+Tstarts <- seq(0.0001, 2.4, by = 0.2)
+Dt <- 0.2
+
+if (max(Tstarts + Dt) > max(surv$time)) {
+  stop("預測終點超過目前資料的最長追蹤時間。")
+}
+```
+
+### 18.2｜移動起點、固定跨度
+
+每次起點向後移動 0.2，終點為起點加上 Dt。每個窗口重新選擇風險集、估計個人效果、預測與評分，不重新配適整個聯合模型。
+
+```r
+result_jsm <- vector("list", length(Tstarts))
+
+for (j in seq_along(Tstarts)) {
+
+  s <- Tstarts[j]
+  t <- s + Dt
+
+  message(
+    "正在計算第 ", j, "/", length(Tstarts),
+    " 組：", s, " → ", t
+  )
+
+  result_jsm[[j]] <- tryCatch(
+    brier_jsm_ipcw(
+      p = jsm_par,
+      history = history_jsm,
+      surv_df = surv,
+      Tstart = s,
+      Thoriz = t
+    ),
+    error = function(e) {
+      stop(
+        "Tstart = ", s,
+        "，Thoriz = ", t,
+        "：", conditionMessage(e),
+        call. = FALSE
+      )
+    }
+  )
+}
+
+tab_semi_k3 <- do.call(rbind, result_jsm)
+
+print(
+  tab_semi_k3,
+  digits = 10,
+  row.names = FALSE
+)
+```
+
+### 18.3｜結果解讀與比較範圍
+
+若完整執行目前設定的 12 組起點與終點，`tab_semi_k3` 成功完成後共有 12 列。每列對應一組起點與終點，而非單一病人。
+
+- `Brier`：該窗口的 IPCW 平均平方預測誤差。
+- `n_risk`：納入評分的病人人數。
+- `n_event`：窗口內發生事件的人數。
+- `n_alive`：追蹤超過終點的人數。
+- `n_unknown`：窗口內設限、終點結局未知的人數。
+- `n_no_history`：因缺少起點以前量測而未納入的人數。
+
+各列應滿足：
+
+```math
+n_{\mathrm{event}}
++
+n_{\mathrm{alive}}
++
+n_{\mathrm{unknown}}
+=
+n_{\mathrm{risk}}.
+```
+
+與 exp、Weibull、樣條 PH 比較時，需使用同一份資料、相同時間網格、相同風險集選取方式與 IPCW 規則。
+
+目前結果具有以下範圍：
+
+1. 使用配適資料本身評分，屬於樣本內表現。
+2. 個人效果使用起點以前歷史與存活資訊重新估計，但整體模型參數仍由完整訓練資料估計。
+3. 預測為經驗貝氏後驗眾數代入，沒有完整積分個人效果及模型參數的不確定性。
+4. JSM 配適採 `nknot = 3`，收斂不等於積分精度已充分確認。
+5. 本節為自訂 JSM 預測與評分實作，不能僅以程式成功執行視為數值及統計方法已驗證。
+6. 此處尚未計算 IBS；沿移動起點積分與固定起點、沿終點積分是不同設計。
 ```
 
 <a id="switch-baseline"></a>
